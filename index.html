@@ -6,6 +6,18 @@
     <meta name="description" content="Editable curriculum table and prerequisite flowchart maker." />
     <title>Curriculum Flowchart Maker</title>
     <link rel="stylesheet" href="/styles.css" />
+    <style>
+      .flow-panel.hide-node-code .node-code { display: none; }
+      .flow-panel.hide-node-description .node-title { display: none; }
+      .flow-panel.hide-node-units .node-units { display: none; }
+      .flow-panel.hide-node-track .node-track,
+      .flow-panel.hide-node-track .node-track-separator { display: none; }
+      .flow-panel.hide-node-units.hide-node-track .node-meta { display: none; }
+      .display-options .switch { min-height: 36px; }
+      @media (max-width: 760px) {
+        .display-options .switch { min-height: 44px; }
+      }
+    </style>
   </head>
   <body>
     <div id="app" class="app-shell">
@@ -101,6 +113,14 @@
                 <button class="toolbar-button compact" type="button" data-align="distribute-vertical">Distribute V</button>
               </div>
 
+              <div class="toolbar-group display-options" aria-label="Course box display options">
+                <span class="toolbar-label">Show</span>
+                <label class="switch"><input id="display-code-toggle" type="checkbox" checked /> Code</label>
+                <label class="switch"><input id="display-description-toggle" type="checkbox" checked /> Description</label>
+                <label class="switch"><input id="display-units-toggle" type="checkbox" checked /> Units</label>
+                <label class="switch"><input id="display-track-toggle" type="checkbox" checked /> Track</label>
+              </div>
+
               <div class="toolbar-group zoom-group" aria-label="Zoom tools">
                 <span class="toolbar-label">Zoom</span>
                 <button id="zoom-out" class="toolbar-button zoom-button" type="button" aria-label="Zoom out">−</button>
@@ -167,6 +187,131 @@
       </datalist>
     </div>
 
+    <script>
+      (() => {
+        const STORAGE_KEY = 'curriculum-flowchart:display-options:v1';
+        const defaults = { code: true, description: true, units: true, track: true };
+        let options = { ...defaults };
+        try {
+          const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+          if (stored && typeof stored === 'object') options = { ...defaults, ...stored };
+        } catch { /* use defaults */ }
+
+        const flowPanel = document.querySelector('#flow-panel');
+        const nodesLayer = document.querySelector('#nodes-layer');
+        const controls = {
+          code: document.querySelector('#display-code-toggle'),
+          description: document.querySelector('#display-description-toggle'),
+          units: document.querySelector('#display-units-toggle'),
+          track: document.querySelector('#display-track-toggle'),
+        };
+
+        const patchNodeMeta = () => {
+          if (!nodesLayer) return;
+          nodesLayer.querySelectorAll('.node-meta:not([data-display-patched])').forEach(meta => {
+            const text = (meta.textContent || '').trim();
+            const separatorIndex = text.indexOf(' · ');
+            const unitsText = separatorIndex >= 0 ? text.slice(0, separatorIndex) : text;
+            const trackText = separatorIndex >= 0 ? text.slice(separatorIndex + 3) : '';
+            meta.textContent = '';
+
+            const units = document.createElement('span');
+            units.className = 'node-units';
+            units.textContent = unitsText;
+            meta.append(units);
+
+            if (trackText) {
+              const separator = document.createElement('span');
+              separator.className = 'node-track-separator';
+              separator.textContent = ' · ';
+              meta.append(separator);
+
+              const track = document.createElement('span');
+              track.className = 'node-track';
+              track.textContent = trackText;
+              meta.append(track);
+            }
+            meta.setAttribute('data-display-patched', 'true');
+          });
+        };
+
+        const apply = () => {
+          if (!flowPanel) return;
+          flowPanel.classList.toggle('hide-node-code', !options.code);
+          flowPanel.classList.toggle('hide-node-description', !options.description);
+          flowPanel.classList.toggle('hide-node-units', !options.units);
+          flowPanel.classList.toggle('hide-node-track', !options.track);
+          Object.entries(controls).forEach(([key, input]) => {
+            if (input instanceof HTMLInputElement) input.checked = Boolean(options[key]);
+          });
+          patchNodeMeta();
+        };
+
+        Object.entries(controls).forEach(([key, input]) => {
+          if (!(input instanceof HTMLInputElement)) return;
+          input.addEventListener('change', () => {
+            options[key] = input.checked;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(options));
+            apply();
+          });
+        });
+
+        if (nodesLayer) new MutationObserver(patchNodeMeta).observe(nodesLayer, { childList: true, subtree: true });
+
+        const filterExportSvg = svgText => {
+          try {
+            const documentXml = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+            const groups = [...documentXml.querySelectorAll('g')].filter(group => {
+              const rect = group.querySelector(':scope > rect');
+              return rect?.getAttribute('width') === '184' && rect?.getAttribute('height') === '78';
+            });
+
+            groups.forEach(group => {
+              const texts = [...group.querySelectorAll(':scope > text')];
+              const code = texts.find(text => text.getAttribute('font-size') === '12' && text.getAttribute('font-weight') === '700');
+              const descriptions = texts.filter(text => text.getAttribute('font-size') === '10.5');
+              const meta = texts.find(text => text.getAttribute('font-size') === '9.5');
+
+              if (!options.code) code?.remove();
+              if (!options.description) descriptions.forEach(text => text.remove());
+
+              if (meta) {
+                const current = meta.textContent || '';
+                const separatorIndex = current.indexOf(' · ');
+                const unitsText = separatorIndex >= 0 ? current.slice(0, separatorIndex) : current;
+                const trackText = separatorIndex >= 0 ? current.slice(separatorIndex + 3) : '';
+                if (!options.units && !options.track) meta.remove();
+                else if (!options.units) meta.textContent = options.track ? trackText : '';
+                else if (!options.track) meta.textContent = unitsText;
+              }
+            });
+            return new XMLSerializer().serializeToString(documentXml.documentElement);
+          } catch {
+            return svgText;
+          }
+        };
+
+        const downloadButton = document.querySelector('#download-image');
+        downloadButton?.addEventListener('click', () => {
+          const NativeBlob = window.Blob;
+          class DisplayFilteredBlob extends NativeBlob {
+            constructor(parts, blobOptions) {
+              let nextParts = parts;
+              if (blobOptions?.type?.startsWith('image/svg+xml') && parts?.length === 1 && typeof parts[0] === 'string' && parts[0].includes('export-arrow')) {
+                nextParts = [filterExportSvg(parts[0])];
+              }
+              super(nextParts, blobOptions);
+            }
+          }
+          window.Blob = DisplayFilteredBlob;
+          setTimeout(() => {
+            if (window.Blob === DisplayFilteredBlob) window.Blob = NativeBlob;
+          }, 0);
+        }, true);
+
+        apply();
+      })();
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>
