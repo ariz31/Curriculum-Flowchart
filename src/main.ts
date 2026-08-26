@@ -16,10 +16,16 @@ const ROUTE_CLEARANCE = 9;
 const ROUTE_TRACK_SPACING = 9;
 const YEARS = ['First Year', 'Second Year', 'Third Year', 'Fourth Year'];
 const TERMS = ['First Semester', 'Second Semester', 'Short Term'];
+const DEFAULT_TRACKS = ['Common', 'Structural', 'Geotechnical'];
 const DEFAULT_VIEWPORT: CanvasViewportState = { scale: 1, x: 24, y: 24 };
 
 type LayoutMode = 'basic' | 'optimized';
-type RuntimeState = PersistedState & { viewport: CanvasViewportState; layoutMode: LayoutMode };
+type RuntimeState = PersistedState & {
+  viewport: CanvasViewportState;
+  layoutMode: LayoutMode;
+  trackFilter: string;
+  hiddenTracks: string[];
+};
 interface Column { year: string; term: string; x: number; }
 interface PointerPoint { x: number; y: number; }
 interface CorequisitePair { key: string; aId: string; bId: string; }
@@ -75,6 +81,10 @@ const snap = q<HTMLInputElement>('#snap-toggle');
 const multiSelectButton = q<HTMLButtonElement>('#multi-select-toggle');
 const zoomDisplay = q<HTMLOutputElement>('#zoom-display');
 const downloadButton = q<HTMLButtonElement>('#download-image');
+const trackFilterControl = q<HTMLSelectElement>('#track-filter');
+const trackVisibility = q<HTMLElement>('#track-visibility');
+const showAllTracksButton = q<HTMLButtonElement>('#show-all-tracks');
+const trackDatalist = q<HTMLDataListElement>('#track-options');
 
 let state = load();
 let selected = new Set<string>();
@@ -88,6 +98,18 @@ const activePointers = new Map<number, PointerPoint>();
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function inferTrackFromCode(courseNo: string): string {
+  const value = courseNo.trim();
+  if (/\sS\d+$/i.test(value)) return 'Structural';
+  if (/\sG\d+$/i.test(value)) return 'Geotechnical';
+  return 'Common';
+}
+
+function normalizeTrackName(value?: string): string {
+  const normalized = (value ?? '').trim().replace(/\s+/g, ' ');
+  return normalized || 'Common';
 }
 
 function sanitizeViewport(value?: CanvasViewportState): CanvasViewportState {
@@ -104,12 +126,19 @@ function load(): RuntimeState {
     if (raw) {
       const parsed = JSON.parse(raw) as PersistedState;
       if (Array.isArray(parsed.courses) && parsed.courses.length) {
+        const migratedCourses = parsed.courses.map(course => ({
+          ...course,
+          track: normalizeTrackName(course.track || inferTrackFromCode(course.courseNo)),
+        }));
         return {
           ...parsed,
+          courses: migratedCourses,
           positions: parsed.positions ?? {},
           snapToGrid: parsed.snapToGrid !== false,
           viewport: sanitizeViewport(parsed.viewport),
           layoutMode: parsed.layoutMode === 'optimized' ? 'optimized' : 'basic',
+          trackFilter: typeof parsed.trackFilter === 'string' && parsed.trackFilter.trim() ? parsed.trackFilter : 'all',
+          hiddenTracks: Array.isArray(parsed.hiddenTracks) ? parsed.hiddenTracks.map(normalizeTrackName) : [],
           updatedAt: parsed.updatedAt ?? Date.now(),
         };
       }
@@ -121,6 +150,8 @@ function load(): RuntimeState {
     snapToGrid: true,
     viewport: { ...DEFAULT_VIEWPORT },
     layoutMode: 'basic',
+    trackFilter: 'all',
+    hiddenTracks: [],
     updatedAt: Date.now(),
   };
 }
@@ -145,6 +176,71 @@ const terms = (year: string): string[] => ordered(state.courses.filter(course =>
 const byId = (id: string): CurriculumCourse | undefined => state.courses.find(course => course.id === id);
 const byCode = (code: string): CurriculumCourse | undefined => state.courses.find(course => norm(course.courseNo) === norm(code));
 
+function courseTrack(course: CurriculumCourse): string {
+  return normalizeTrackName(course.track || inferTrackFromCode(course.courseNo));
+}
+
+function trackNames(): string[] {
+  const found = unique(state.courses.map(courseTrack));
+  return ordered(found, DEFAULT_TRACKS.filter(track => found.some(value => norm(value) === norm(track))));
+}
+
+function hiddenTrackKeys(): Set<string> {
+  return new Set(state.hiddenTracks.map(norm));
+}
+
+function visibleCourses(): CurriculumCourse[] {
+  const hidden = hiddenTrackKeys();
+  const filter = norm(state.trackFilter || 'all');
+  return state.courses.filter(course => {
+    const track = courseTrack(course);
+    const key = norm(track);
+    if (hidden.has(key)) return false;
+    if (filter === 'all') return true;
+    return key === 'common' || key === filter;
+  });
+}
+
+function visibleCourseIds(): Set<string> {
+  return new Set(visibleCourses().map(course => course.id));
+}
+
+function renderTrackControls(): void {
+  const tracks = trackNames();
+  const available = new Set(tracks.map(norm));
+  if (state.trackFilter !== 'all' && !available.has(norm(state.trackFilter))) state.trackFilter = 'all';
+  const hidden = hiddenTrackKeys();
+  state.hiddenTracks = tracks.filter(track => hidden.has(norm(track)));
+
+  trackFilterControl.innerHTML = [
+    '<option value="all">All tracks</option>',
+    ...tracks.map(track => {
+      const label = norm(track) === 'common' ? 'Common only' : `${track} + Common`;
+      return `<option value="${esc(track)}">${esc(label)}</option>`;
+    }),
+  ].join('');
+  trackFilterControl.value = state.trackFilter === 'all' ? 'all' : tracks.find(track => norm(track) === norm(state.trackFilter)) ?? 'all';
+
+  trackVisibility.innerHTML = tracks.map(track => `
+    <label class="switch">
+      <input type="checkbox" data-track="${esc(track)}"${hidden.has(norm(track)) ? '' : ' checked'} />
+      ${esc(track)}
+    </label>`).join('');
+
+  trackDatalist.innerHTML = tracks.map(track => `<option value="${esc(track)}"></option>`).join('');
+}
+
+function applyTrackViewChange(): void {
+  const visible = visibleCourseIds();
+  selected = new Set([...selected].filter(id => visible.has(id)));
+  if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
+  else routePlans = null;
+  renderTrackControls();
+  renderTable();
+  renderFlow();
+  save();
+}
+
 function columns(): Column[] {
   const result: Column[] = [];
   let index = 0;
@@ -165,10 +261,11 @@ function defaultPos(course: CurriculumCourse): NodePosition {
 
 function corequisitePairs(): CorequisitePair[] {
   const pairs = new Map<string, CorequisitePair>();
-  for (const course of state.courses) {
+  const visible = visibleCourseIds();
+  for (const course of visibleCourses()) {
     for (const code of course.corequisites) {
       const other = byCode(code);
-      if (!other || other.id === course.id) continue;
+      if (!other || other.id === course.id || !visible.has(other.id)) continue;
       if (other.yearLevel !== course.yearLevel || other.semester !== course.semester) continue;
       const [aId, bId] = [course.id, other.id].sort();
       const key = `${aId}|${bId}`;
@@ -213,6 +310,7 @@ function setBasicRouting(): void {
 
 function dependencyEdges(pairs = corequisitePairs()): DependencyEdge[] {
   const edges: DependencyEdge[] = [];
+  const visible = visibleCourseIds();
   const pairCourses = new Map(pairs.map(pair => {
     const a = byId(pair.aId);
     const b = byId(pair.bId);
@@ -233,12 +331,12 @@ function dependencyEdges(pairs = corequisitePairs()): DependencyEdge[] {
     for (const code of codes) {
       if (!remaining.has(norm(code))) continue;
       const from = byCode(code);
-      if (!from || from.id === course.id) continue;
+      if (!from || from.id === course.id || !visible.has(from.id)) continue;
       edges.push({ key: `course:${from.id}->${course.id}:${type}`, sourceKind: 'course', fromId: from.id, toId: course.id, type });
       remaining.delete(norm(code));
     }
   };
-  for (const course of state.courses) {
+  for (const course of visibleCourses()) {
     addFor(course, course.prerequisites, 'prerequisite');
     addFor(course, course.electivePrerequisites, 'elective');
   }
@@ -265,11 +363,13 @@ function pairGeometry(pair: CorequisitePair): PairGeometry | null {
 }
 
 function buildLayoutUnits(cols: Column[], pairs: CorequisitePair[]): { columns: LayoutUnit[][]; unitByNode: Map<string, LayoutUnit> } {
+  const activeCourses = visibleCourses();
+  const activeIds = new Set(activeCourses.map(course => course.id));
   const pairMap = new Map<string, Set<string>>();
-  for (const course of state.courses) pairMap.set(course.id, new Set([course.id]));
+  for (const course of activeCourses) pairMap.set(course.id, new Set([course.id]));
   for (const pair of pairs) {
     const merged = new Set([...(pairMap.get(pair.aId) ?? [pair.aId]), ...(pairMap.get(pair.bId) ?? [pair.bId])]);
-    for (const id of merged) pairMap.set(id, merged);
+    for (const id of merged) if (activeIds.has(id)) pairMap.set(id, merged);
   }
   let changed = true;
   while (changed) {
@@ -277,6 +377,7 @@ function buildLayoutUnits(cols: Column[], pairs: CorequisitePair[]): { columns: 
     for (const pair of pairs) {
       const union = new Set([...(pairMap.get(pair.aId) ?? []), ...(pairMap.get(pair.bId) ?? [])]);
       for (const id of union) {
+        if (!activeIds.has(id)) continue;
         const current = pairMap.get(id) ?? new Set<string>();
         if (current.size !== union.size || [...union].some(value => !current.has(value))) {
           pairMap.set(id, new Set(union));
@@ -287,7 +388,7 @@ function buildLayoutUnits(cols: Column[], pairs: CorequisitePair[]): { columns: 
   }
   const unitByNode = new Map<string, LayoutUnit>();
   const layoutColumns = cols.map((column, columnIndex) => {
-    const courses = state.courses.filter(course => course.yearLevel === column.year && course.semester === column.term);
+    const courses = activeCourses.filter(course => course.yearLevel === column.year && course.semester === column.term);
     const seen = new Set<string>();
     const units: LayoutUnit[] = [];
     for (const course of courses) {
@@ -295,7 +396,7 @@ function buildLayoutUnits(cols: Column[], pairs: CorequisitePair[]): { columns: 
       const ids = [...(pairMap.get(course.id) ?? new Set([course.id]))]
         .filter(id => {
           const member = byId(id);
-          return member?.yearLevel === column.year && member?.semester === column.term;
+          return activeIds.has(id) && member?.yearLevel === column.year && member?.semester === column.term;
         })
         .sort((a, b) => (state.positions[a]?.y ?? 0) - (state.positions[b]?.y ?? 0));
       ids.forEach(id => seen.add(id));
@@ -438,6 +539,7 @@ function alignUnitCenters(layoutColumns: LayoutUnit[][], edges: DependencyEdge[]
     }
   }
   const allUnits = layoutColumns.flat();
+  if (!allUnits.length) return;
   const minimumTop = Math.min(TOP, ...allUnits.map(unit => unit.center - unit.height / 2));
   const shift = TOP - minimumTop;
   if (Math.abs(shift) > 0.01) allUnits.forEach(unit => { unit.center += shift; });
@@ -527,7 +629,8 @@ function optimizeLayout(): void {
   save();
   renderFlow();
   requestAnimationFrame(() => requestAnimationFrame(fitView));
-  flowHint.textContent = `Auto sort aligned prerequisite chains, kept corequisite pairs together, and added vertical clearance only where routing needed it.`;
+  const activeFilter = state.trackFilter === 'all' ? 'all visible tracks' : `${state.trackFilter} + Common`;
+  flowHint.textContent = `Auto sort optimized ${activeFilter}, aligned prerequisite chains, and added vertical clearance only where routing needed it.`;
 }
 
 function edgeTargetColumn(edge: DependencyEdge, cols = columns()): number {
@@ -593,7 +696,7 @@ function targetAnchor(edge: DependencyEdge, edges: DependencyEdge[], pairs: Core
 function horizontalClear(y: number, x1: number, x2: number, excludedIds: Set<string>): boolean {
   const left = Math.min(x1, x2) + 2;
   const right = Math.max(x1, x2) - 2;
-  for (const course of state.courses) {
+  for (const course of visibleCourses()) {
     if (excludedIds.has(course.id)) continue;
     const position = state.positions[course.id];
     if (!position) continue;
@@ -619,9 +722,11 @@ function findClearCorridorY(edge: DependencyEdge, edges: DependencyEdge[], pairs
   const target = targetAnchor(edge, edges, pairs, cols);
   if (!source || !target) return TOP - 20;
   const excluded = edgeExcludedIds(edge, pairs);
-  const maxBottom = Math.max(TOP + H, ...Object.values(state.positions).map(position => position.y + H));
+  const visible = visibleCourses();
+  const visiblePositions = visible.map(course => state.positions[course.id]).filter((position): position is NodePosition => Boolean(position));
+  const maxBottom = Math.max(TOP + H, ...visiblePositions.map(position => position.y + H));
   const candidates: number[] = [];
-  const occupied = state.courses
+  const occupied = visible
     .filter(course => !excluded.has(course.id))
     .map(course => state.positions[course.id])
     .filter((position): position is NodePosition => Boolean(position))
@@ -743,8 +848,9 @@ function edgePath(edge: DependencyEdge, edges: DependencyEdge[], pairs: Corequis
 function autoLayout(): void {
   setBasicRouting();
   const cols = columns();
+  const visible = visibleCourses();
   cols.forEach(column => {
-    state.courses.filter(course => course.yearLevel === column.year && course.semester === column.term).forEach((course, index) => {
+    visible.filter(course => course.yearLevel === column.year && course.semester === column.term).forEach((course, index) => {
       state.positions[course.id] = { x: column.x, y: TOP + index * (H + GAP) };
     });
   });
@@ -758,11 +864,22 @@ function autoLayout(): void {
 
 function renderTable(): void {
   const needle = norm(search.value);
-  const courses = state.courses.filter(course => !needle || [course.yearLevel, course.semester, course.courseNo, course.title, ...course.prerequisites, ...course.corequisites, ...course.electivePrerequisites, ...course.otherRequirements].some(value => norm(value).includes(needle)));
+  const courses = visibleCourses().filter(course => !needle || [
+    course.yearLevel,
+    course.semester,
+    courseTrack(course),
+    course.courseNo,
+    course.title,
+    ...course.prerequisites,
+    ...course.corequisites,
+    ...course.electivePrerequisites,
+    ...course.otherRequirements,
+  ].some(value => norm(value).includes(needle)));
   tbody.innerHTML = courses.map(course => `
     <tr data-id="${course.id}">
       <td data-label="Year Level"><input class="table-input wide-input" data-f="yearLevel" list="year-options" value="${esc(course.yearLevel)}" aria-label="${esc(course.courseNo)} year level"></td>
       <td data-label="Semester"><input class="table-input wide-input" data-f="semester" list="semester-options" value="${esc(course.semester)}" aria-label="${esc(course.courseNo)} semester"></td>
+      <td data-label="Track"><input class="table-input wide-input" data-f="track" list="track-options" value="${esc(courseTrack(course))}" aria-label="${esc(course.courseNo)} track distinction"></td>
       <td data-label="Course No."><input class="table-input code-input" data-f="courseNo" value="${esc(course.courseNo)}" aria-label="Course number"></td>
       <td data-label="Title"><input class="table-input title-input" data-f="title" value="${esc(course.title)}" aria-label="${esc(course.courseNo)} descriptive title"></td>
       <td data-label="Units"><input class="table-input units-input" data-f="units" value="${esc(course.units)}" aria-label="${esc(course.courseNo)} units"></td>
@@ -772,15 +889,16 @@ function renderTable(): void {
       <td data-label="Other requirements"><input class="table-input relation-input" data-f="otherRequirements" value="${esc(course.otherRequirements.join(', '))}" aria-label="${esc(course.courseNo)} other requirements"></td>
       <td data-label="Actions" class="row-actions"><button class="icon-button" type="button" data-act="locate">Locate</button><button class="icon-button danger" type="button" data-act="delete">Delete</button></td>
     </tr>`).join('');
-  count.textContent = `${state.courses.length} courses`;
+  count.textContent = courses.length === state.courses.length ? `${state.courses.length} courses` : `${courses.length} shown · ${state.courses.length} total`;
 }
 
 function updateField(id: string, field: keyof CurriculumCourse, value: string, oldCode?: string): void {
   const course = byId(id);
   if (!course) return;
-  const topologyChanged = field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'yearLevel' || field === 'semester' || field === 'courseNo';
+  const topologyChanged = field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'yearLevel' || field === 'semester' || field === 'courseNo' || field === 'track';
   if (topologyChanged) setBasicRouting();
   if (field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'otherRequirements') course[field] = list(value);
+  else if (field === 'track') course.track = normalizeTrackName(value);
   else if (field === 'yearLevel' || field === 'semester' || field === 'courseNo' || field === 'title' || field === 'units') course[field] = value;
   if (field === 'courseNo' && oldCode && norm(oldCode) !== norm(value)) {
     const replace = (items: string[]): string[] => items.map(item => norm(item) === norm(oldCode) ? value : item);
@@ -792,6 +910,7 @@ function updateField(id: string, field: keyof CurriculumCourse, value: string, o
   }
   if (field === 'yearLevel' || field === 'semester') state.positions[id] = defaultPos(course);
   ensurePositions();
+  renderTrackControls();
   save();
   renderFlow();
 }
@@ -799,9 +918,22 @@ function updateField(id: string, field: keyof CurriculumCourse, value: string, o
 function addCourse(): void {
   setBasicRouting();
   const id = `course-${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
-  const course: CurriculumCourse = { id, yearLevel: 'First Year', semester: 'First Semester', courseNo: `NEW ${state.courses.length + 1}`, title: 'New Course', units: '3', prerequisites: [], corequisites: [], electivePrerequisites: [], otherRequirements: [] };
+  const course: CurriculumCourse = {
+    id,
+    yearLevel: 'First Year',
+    semester: 'First Semester',
+    track: 'Common',
+    courseNo: `NEW ${state.courses.length + 1}`,
+    title: 'New Course',
+    units: '3',
+    prerequisites: [],
+    corequisites: [],
+    electivePrerequisites: [],
+    otherRequirements: [],
+  };
   state.courses.push(course);
   state.positions[id] = defaultPos(course);
+  renderTrackControls();
   save();
   renderTable();
   renderFlow();
@@ -820,6 +952,7 @@ function deleteCourse(id: string): void {
     item.corequisites = clean(item.corequisites);
     item.electivePrerequisites = clean(item.electivePrerequisites);
   });
+  renderTrackControls();
   save();
   renderTable();
   renderFlow();
@@ -836,8 +969,9 @@ function termClass(term: string): string {
 
 function updateCanvasSize(): void {
   const cols = columns();
-  const maxNodeX = Math.max(0, ...Object.values(state.positions).map(position => position.x + W + 100));
-  const maxNodeY = Math.max(0, ...Object.values(state.positions).map(position => position.y + H + 120));
+  const positions = visibleCourses().map(course => state.positions[course.id]).filter((position): position is NodePosition => Boolean(position));
+  const maxNodeX = Math.max(0, ...positions.map(position => position.x + W + 100));
+  const maxNodeY = Math.max(0, ...positions.map(position => position.y + H + 120));
   const routeMaxY = routePlans ? Math.max(0, ...[...routePlans.values()].map(plan => plan.corridorY ?? 0)) + 70 : 0;
   logicalWidth = Math.max(920, cols.length * COL + 70, maxNodeX);
   logicalHeight = Math.max(620, maxNodeY, routeMaxY);
@@ -852,6 +986,7 @@ function renderFlow(): void {
   ensurePositions();
   if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
   const cols = columns();
+  const visible = visibleCourses();
   updateCanvasSize();
   headers.innerHTML = years().map(year => {
     const yearColumns = cols.filter(column => column.year === year);
@@ -859,9 +994,11 @@ function renderFlow(): void {
     const width = yearColumns[yearColumns.length - 1].x - yearColumns[0].x + W;
     return `<div class="year-header ${yearClass(year)}" style="left:${yearColumns[0].x}px;width:${width}px">${esc(year.toUpperCase())}</div>`;
   }).join('') + cols.map(column => `<div class="term-header ${yearClass(column.year)} ${termClass(column.term)}" style="left:${column.x}px;width:${W}px">${esc(column.term)}</div>`).join('');
-  nodes.innerHTML = state.courses.map(course => {
+  nodes.innerHTML = visible.map(course => {
     const position = state.positions[course.id];
-    return `<article class="course-node ${yearClass(course.yearLevel)} ${termClass(course.semester)}${selected.has(course.id) ? ' selected' : ''}" data-id="${course.id}" style="left:${position.x}px;top:${position.y}px" tabindex="0" role="button" aria-label="${esc(`${course.courseNo}, ${course.title}`)}"><div class="node-code">${esc(course.courseNo || 'Untitled')}</div><div class="node-title">${esc(course.title || 'No descriptive title')}</div><div class="node-meta">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}</div></article>`;
+    const track = courseTrack(course);
+    const trackSuffix = norm(track) === 'common' ? '' : ` · ${esc(track)}`;
+    return `<article class="course-node ${yearClass(course.yearLevel)} ${termClass(course.semester)}${selected.has(course.id) ? ' selected' : ''}" data-id="${course.id}" data-track="${esc(track)}" style="left:${position.x}px;top:${position.y}px" tabindex="0" role="button" aria-label="${esc(`${course.courseNo}, ${course.title}, ${track}`)}"><div class="node-code">${esc(course.courseNo || 'Untitled')}</div><div class="node-title">${esc(course.title || 'No descriptive title')}</div><div class="node-meta">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}${trackSuffix}</div></article>`;
   }).join('');
   renderEdges();
   updateSelection();
@@ -1208,6 +1345,7 @@ function buildExportSvg(): string {
   const cols = columns();
   const pairs = corequisitePairs();
   const edges = dependencyEdges(pairs);
+  const visible = visibleCourses();
   const marker = `<defs><marker id="export-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" fill="#29384f"/></marker><marker id="export-coreq-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L7 3.5 L0 7z" fill="#58677d"/></marker></defs>`;
   const background = `<rect width="${logicalWidth}" height="${logicalHeight}" fill="#ffffff"/>`;
   const yearHeaders = years().map(year => {
@@ -1225,13 +1363,15 @@ function buildExportSvg(): string {
     const dash = edge.type === 'elective' ? ' stroke-dasharray="7 5"' : '';
     return `<path d="${edgePath(edge, edges, pairs, cols)}" fill="none" stroke="#29384f" stroke-width="1.5"${dash} marker-end="url(#export-arrow)"/>`;
   }).join('');
-  const nodeMarkup = state.courses.map(course => {
+  const nodeMarkup = visible.map(course => {
     const position = state.positions[course.id];
     const palette = svgPalette(course.yearLevel);
     const fill = svgTermFill(course.yearLevel, course.semester);
     const lines = titleLines(course.title);
     const title = lines.map((line, index) => `<text x="${position.x + 9}" y="${position.y + 38 + index * 12}" font-family="Arial,sans-serif" font-size="10.5" fill="#172033">${esc(line)}</text>`).join('');
-    return `<g><rect x="${position.x}" y="${position.y}" width="${W}" height="${H}" rx="8" fill="${fill}" stroke="${palette.border}" stroke-width="1.5"/><text x="${position.x + 9}" y="${position.y + 19}" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="#172033">${esc(course.courseNo || 'Untitled')}</text>${title}<text x="${position.x + 9}" y="${position.y + 69}" font-family="Arial,sans-serif" font-size="9.5" font-weight="600" fill="#344054">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}</text></g>`;
+    const track = courseTrack(course);
+    const trackSuffix = norm(track) === 'common' ? '' : ` · ${track}`;
+    return `<g><rect x="${position.x}" y="${position.y}" width="${W}" height="${H}" rx="8" fill="${fill}" stroke="${palette.border}" stroke-width="1.5"/><text x="${position.x + 9}" y="${position.y + 19}" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="#172033">${esc(course.courseNo || 'Untitled')}</text>${title}<text x="${position.x + 9}" y="${position.y + 69}" font-family="Arial,sans-serif" font-size="9.5" font-weight="600" fill="#344054">${esc(`${course.units || '—'} unit${course.units === '1' ? '' : 's'}${trackSuffix}`)}</text></g>`;
   }).join('');
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${logicalWidth}" height="${logicalHeight}" viewBox="0 0 ${logicalWidth} ${logicalHeight}">${marker}${background}${yearHeaders}${termHeaders}${coreqMarkup}${edgeMarkup}${nodeMarkup}</svg>`;
 }
@@ -1284,18 +1424,44 @@ tbody.addEventListener('focusin', event => {
 tbody.addEventListener('input', event => {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-f]');
   const row = input?.closest<HTMLTableRowElement>('tr[data-id]');
-  if (input && row) updateField(row.dataset.id!, input.dataset.f as keyof CurriculumCourse, input.value);
+  if (input && row && input.dataset.f !== 'track') updateField(row.dataset.id!, input.dataset.f as keyof CurriculumCourse, input.value);
 });
 tbody.addEventListener('change', event => {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-f]');
   const row = input?.closest<HTMLTableRowElement>('tr[data-id]');
-  if (input && row && input.dataset.f === 'courseNo') { updateField(row.dataset.id!, 'courseNo', input.value, input.dataset.old); renderTable(); }
+  if (!input || !row) return;
+  if (input.dataset.f === 'courseNo') {
+    updateField(row.dataset.id!, 'courseNo', input.value, input.dataset.old);
+    renderTable();
+  } else if (input.dataset.f === 'track') {
+    updateField(row.dataset.id!, 'track', input.value);
+    renderTable();
+  }
 });
 tbody.addEventListener('click', event => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-act]');
   const row = button?.closest<HTMLTableRowElement>('tr[data-id]');
   if (!button || !row) return;
   if (button.dataset.act === 'locate') locate(row.dataset.id!); else deleteCourse(row.dataset.id!);
+});
+
+trackFilterControl.addEventListener('change', () => {
+  state.trackFilter = trackFilterControl.value || 'all';
+  applyTrackViewChange();
+});
+trackVisibility.addEventListener('change', event => {
+  const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-track]');
+  if (!input?.dataset.track) return;
+  const hidden = hiddenTrackKeys();
+  const key = norm(input.dataset.track);
+  if (input.checked) hidden.delete(key); else hidden.add(key);
+  state.hiddenTracks = trackNames().filter(track => hidden.has(norm(track)));
+  applyTrackViewChange();
+});
+showAllTracksButton.addEventListener('click', () => {
+  state.hiddenTracks = [];
+  state.trackFilter = 'all';
+  applyTrackViewChange();
 });
 
 viewport.addEventListener('pointerdown', pointerDown);
@@ -1317,7 +1483,12 @@ viewport.addEventListener('keydown', event => {
   const focusedNode = (event.target as HTMLElement).closest<HTMLElement>('.course-node');
   if ((event.key === 'Enter' || event.key === ' ') && focusedNode) { event.preventDefault(); selected = new Set([focusedNode.dataset.id!]); updateSelection(); return; }
   if (event.key === 'Escape') { selected.clear(); updateSelection(); return; }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') { event.preventDefault(); selected = new Set(state.courses.map(course => course.id)); updateSelection(); return; }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
+    event.preventDefault();
+    selected = new Set(visibleCourses().map(course => course.id));
+    updateSelection();
+    return;
+  }
   const step = event.shiftKey ? 20 : (state.snapToGrid ? GRID : 1);
   if (event.key === 'ArrowLeft') { event.preventDefault(); moveSelectedBy(-step, 0); }
   if (event.key === 'ArrowRight') { event.preventDefault(); moveSelectedBy(step, 0); }
@@ -1330,12 +1501,22 @@ document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => b
 q<HTMLButtonElement>('#add-course').addEventListener('click', addCourse);
 q<HTMLButtonElement>('#reset-sample').addEventListener('click', () => {
   if (!confirm('Replace the current curriculum and layout with the Google Sheets sample?')) return;
-  state = { courses: createSampleCourses(), positions: {}, snapToGrid: true, viewport: { ...DEFAULT_VIEWPORT }, layoutMode: 'basic', updatedAt: Date.now() };
+  state = {
+    courses: createSampleCourses(),
+    positions: {},
+    snapToGrid: true,
+    viewport: { ...DEFAULT_VIEWPORT },
+    layoutMode: 'basic',
+    trackFilter: 'all',
+    hiddenTracks: [],
+    updatedAt: Date.now(),
+  };
   routePlans = null;
   selected.clear();
   setMultiSelect(false);
   snap.checked = true;
   ensurePositions();
+  renderTrackControls();
   save();
   renderTable();
   renderFlow();
@@ -1357,6 +1538,7 @@ snap.addEventListener('change', () => { state.snapToGrid = snap.checked; save();
 window.addEventListener('resize', () => applyViewportTransform());
 
 ensurePositions();
+renderTrackControls();
 if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
 renderTable();
 renderFlow();
