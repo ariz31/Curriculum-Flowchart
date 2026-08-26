@@ -110,6 +110,12 @@ function splitRequirements(value?: string): string[] {
   return value.split(',').map((part) => part.trim()).filter(Boolean);
 }
 
+function inferTrack(courseNo: string): string {
+  if (/\sS\d+$/i.test(courseNo.trim())) return 'Structural';
+  if (/\sG\d+$/i.test(courseNo.trim())) return 'Geotechnical';
+  return 'Common';
+}
+
 export function createSampleCourses(): CurriculumCourse[] {
   const knownCodes = new Map(RAW_COURSES.map((row) => [normalize(row[2]), row]));
 
@@ -134,6 +140,7 @@ export function createSampleCourses(): CurriculumCourse[] {
       id: `course-${index + 1}`,
       yearLevel,
       semester,
+      track: inferTrack(courseNo),
       courseNo,
       title,
       units,
