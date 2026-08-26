@@ -26,6 +26,20 @@
         <button class="tab-button" type="button" data-view="flow" role="tab" aria-selected="false">Flowchart</button>
       </nav>
 
+      <section class="panel" aria-label="Curriculum track controls" style="padding-bottom:0">
+        <div class="table-toolbar">
+          <div class="toolbar-group">
+            <span class="toolbar-label">Track filter</span>
+            <select id="track-filter" class="search-input" aria-label="Filter curriculum by track"></select>
+          </div>
+          <div class="toolbar-group" aria-label="Visible tracks">
+            <span class="toolbar-label">Show / hide</span>
+            <div id="track-visibility" class="toolbar-group"></div>
+            <button id="show-all-tracks" class="secondary-button" type="button">Show all</button>
+          </div>
+        </div>
+      </section>
+
       <main>
         <section id="table-panel" class="panel" aria-label="Curriculum table editor">
           <div class="table-toolbar">
@@ -33,7 +47,7 @@
               <button id="add-course" class="secondary-button" type="button">+ Add course</button>
               <span id="course-count" class="course-count"></span>
             </div>
-            <input id="course-search" class="search-input" type="search" placeholder="Search course code, title, year, or requirement…" aria-label="Search curriculum courses" />
+            <input id="course-search" class="search-input" type="search" placeholder="Search course code, title, track, year, or requirement…" aria-label="Search curriculum courses" />
           </div>
 
           <div class="table-wrap">
@@ -42,6 +56,7 @@
                 <tr>
                   <th>Year Level</th>
                   <th>Semester</th>
+                  <th>Track</th>
                   <th>Course No.</th>
                   <th>Course Descriptive Title</th>
                   <th>Units</th>
@@ -144,6 +159,11 @@
         <option value="Second Semester"></option>
         <option value="Short Term"></option>
         <option value="Summer"></option>
+      </datalist>
+      <datalist id="track-options">
+        <option value="Common"></option>
+        <option value="Structural"></option>
+        <option value="Geotechnical"></option>
       </datalist>
     </div>
 
