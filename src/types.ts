@@ -5,6 +5,7 @@ export interface CurriculumCourse {
   id: string;
   yearLevel: YearLevel;
   semester: Semester;
+  track: string;
   courseNo: string;
   title: string;
   units: string;
@@ -33,6 +34,8 @@ export interface PersistedState {
   snapToGrid: boolean;
   viewport?: CanvasViewportState;
   layoutMode?: LayoutMode;
+  trackFilter?: string;
+  hiddenTracks?: string[];
   updatedAt: number;
 }
 
