@@ -25,11 +25,14 @@ export interface CanvasViewportState {
   y: number;
 }
 
+export type LayoutMode = 'basic' | 'optimized';
+
 export interface PersistedState {
   courses: CurriculumCourse[];
   positions: Record<string, NodePosition>;
   snapToGrid: boolean;
   viewport?: CanvasViewportState;
+  layoutMode?: LayoutMode;
   updatedAt: number;
 }
 
