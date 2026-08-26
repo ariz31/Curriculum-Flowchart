@@ -19,10 +19,17 @@ export interface NodePosition {
   y: number;
 }
 
+export interface CanvasViewportState {
+  scale: number;
+  x: number;
+  y: number;
+}
+
 export interface PersistedState {
   courses: CurriculumCourse[];
   positions: Record<string, NodePosition>;
   snapToGrid: boolean;
+  viewport?: CanvasViewportState;
   updatedAt: number;
 }
 
