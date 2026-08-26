@@ -1,0 +1,13 @@
+{
+  "name": "curriculum-flowchart",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "rm -rf dist && tsc && cp index.html styles.css dist/ && sed -i 's|/src/main.js|/main.js|' dist/index.html",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.3"
+  }
+}
