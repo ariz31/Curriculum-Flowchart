@@ -1,5 +1,5 @@
 import { createSampleCourses } from './sampleData.js';
-import type { AlignmentAction, CanvasViewportState, CurriculumCourse, NodePosition, PersistedState, Relationship } from './types.js';
+import type { AlignmentAction, CanvasViewportState, CurriculumCourse, NodePosition, PersistedState } from './types.js';
 
 const KEY = 'curriculum-flowchart:v1';
 const W = 184;
@@ -10,16 +10,42 @@ const GAP = 20;
 const GRID = 10;
 const MIN_SCALE = 0.15;
 const MAX_SCALE = 2.5;
-const OPT_BASE_GAP = 30;
-const OPT_TRACK_SPACING = 8;
+const BASE_UNIT_GAP = 14;
+const COREQ_GAP = 34;
+const ROUTE_CLEARANCE = 9;
+const ROUTE_TRACK_SPACING = 9;
 const YEARS = ['First Year', 'Second Year', 'Third Year', 'Fourth Year'];
 const TERMS = ['First Semester', 'Second Semester', 'Short Term'];
 const DEFAULT_VIEWPORT: CanvasViewportState = { scale: 1, x: 24, y: 24 };
 
-type RuntimeState = PersistedState & { viewport: CanvasViewportState };
+type LayoutMode = 'basic' | 'optimized';
+type RuntimeState = PersistedState & { viewport: CanvasViewportState; layoutMode: LayoutMode };
 interface Column { year: string; term: string; x: number; }
 interface PointerPoint { x: number; y: number; }
-interface OptimizedRoute { d: string; }
+interface CorequisitePair { key: string; aId: string; bId: string; }
+interface LayoutUnit { key: string; ids: string[]; columnIndex: number; height: number; center: number; }
+type DependencyType = 'prerequisite' | 'elective';
+type DependencyEdge =
+  | { key: string; sourceKind: 'course'; fromId: string; toId: string; type: DependencyType }
+  | { key: string; sourceKind: 'pair'; pairKey: string; toId: string; type: DependencyType };
+interface RoutePlan {
+  kind: 'straight' | 'adjacent' | 'corridor';
+  laneX?: number;
+  sourceLaneX?: number;
+  targetLaneX?: number;
+  corridorY?: number;
+}
+interface Anchor { x: number; y: number; }
+interface PairGeometry {
+  pair: CorequisitePair;
+  upperId: string;
+  lowerId: string;
+  x: number;
+  upperBottom: number;
+  lowerTop: number;
+  junctionY: number;
+}
+
 type Gesture =
   | { kind: 'node'; pointerId: number; nodeId: string; startX: number; startY: number; starts: Map<string, NodePosition>; additive: boolean; wasSelected: boolean; moved: boolean }
   | { kind: 'pan'; pointerId: number; startX: number; startY: number; startPanX: number; startPanY: number; moved: boolean }
@@ -57,7 +83,7 @@ let multiSelect = false;
 let gesture: Gesture = null;
 let logicalWidth = 920;
 let logicalHeight = 620;
-let optimizedRoutes: Map<string, OptimizedRoute> | null = null;
+let routePlans: Map<string, RoutePlan> | null = null;
 const activePointers = new Map<number, PointerPoint>();
 
 function clamp(value: number, min: number, max: number): number {
@@ -83,6 +109,7 @@ function load(): RuntimeState {
           positions: parsed.positions ?? {},
           snapToGrid: parsed.snapToGrid !== false,
           viewport: sanitizeViewport(parsed.viewport),
+          layoutMode: parsed.layoutMode === 'optimized' ? 'optimized' : 'basic',
           updatedAt: parsed.updatedAt ?? Date.now(),
         };
       }
@@ -93,6 +120,7 @@ function load(): RuntimeState {
     positions: {},
     snapToGrid: true,
     viewport: { ...DEFAULT_VIEWPORT },
+    layoutMode: 'basic',
     updatedAt: Date.now(),
   };
 }
@@ -124,46 +152,613 @@ function columns(): Column[] {
   return result;
 }
 
+function columnIndexForCourse(course: CurriculumCourse, cols = columns()): number {
+  return cols.findIndex(column => column.year === course.yearLevel && column.term === course.semester);
+}
+
 function defaultPos(course: CurriculumCourse): NodePosition {
-  const column = columns().find(item => item.year === course.yearLevel && item.term === course.semester);
+  const cols = columns();
+  const column = cols.find(item => item.year === course.yearLevel && item.term === course.semester);
   const peers = state.courses.filter(item => item.yearLevel === course.yearLevel && item.semester === course.semester);
   return { x: column?.x ?? 34, y: TOP + Math.max(0, peers.findIndex(item => item.id === course.id)) * (H + GAP) };
+}
+
+function corequisitePairs(): CorequisitePair[] {
+  const pairs = new Map<string, CorequisitePair>();
+  for (const course of state.courses) {
+    for (const code of course.corequisites) {
+      const other = byCode(code);
+      if (!other || other.id === course.id) continue;
+      if (other.yearLevel !== course.yearLevel || other.semester !== course.semester) continue;
+      const [aId, bId] = [course.id, other.id].sort();
+      const key = `${aId}|${bId}`;
+      pairs.set(key, { key, aId, bId });
+    }
+  }
+  return [...pairs.values()];
+}
+
+function corequisiteComponentIds(seedId: string, pairs = corequisitePairs()): Set<string> {
+  const result = new Set([seedId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pair of pairs) {
+      if (result.has(pair.aId) || result.has(pair.bId)) {
+        if (!result.has(pair.aId)) { result.add(pair.aId); changed = true; }
+        if (!result.has(pair.bId)) { result.add(pair.bId); changed = true; }
+      }
+    }
+  }
+  return result;
 }
 
 function ensurePositions(): void {
   const ids = new Set(state.courses.map(course => course.id));
   Object.keys(state.positions).forEach(id => { if (!ids.has(id)) delete state.positions[id]; });
   state.courses.forEach(course => { state.positions[course.id] ??= defaultPos(course); });
+  const pairs = corequisitePairs();
+  for (const pair of pairs) {
+    const a = state.positions[pair.aId];
+    const b = state.positions[pair.bId];
+    if (!a || !b) continue;
+    if (Math.abs(a.x - b.x) > 0.5) b.x = a.x;
+  }
 }
 
-function invalidateOptimizedRouting(): void {
-  optimizedRoutes = null;
+function setBasicRouting(): void {
+  state.layoutMode = 'basic';
+  routePlans = null;
+}
+
+function dependencyEdges(pairs = corequisitePairs()): DependencyEdge[] {
+  const edges: DependencyEdge[] = [];
+  const pairCourses = new Map(pairs.map(pair => {
+    const a = byId(pair.aId);
+    const b = byId(pair.bId);
+    return [pair.key, a && b ? [norm(a.courseNo), norm(b.courseNo)] as const : null] as const;
+  }));
+  const addFor = (course: CurriculumCourse, codes: string[], type: DependencyType): void => {
+    const remaining = new Set(codes.map(norm));
+    for (const pair of pairs) {
+      const normalized = pairCourses.get(pair.key);
+      if (!normalized) continue;
+      const [aCode, bCode] = normalized;
+      if (remaining.has(aCode) && remaining.has(bCode)) {
+        edges.push({ key: `pair:${pair.key}->${course.id}:${type}`, sourceKind: 'pair', pairKey: pair.key, toId: course.id, type });
+        remaining.delete(aCode);
+        remaining.delete(bCode);
+      }
+    }
+    for (const code of codes) {
+      if (!remaining.has(norm(code))) continue;
+      const from = byCode(code);
+      if (!from || from.id === course.id) continue;
+      edges.push({ key: `course:${from.id}->${course.id}:${type}`, sourceKind: 'course', fromId: from.id, toId: course.id, type });
+      remaining.delete(norm(code));
+    }
+  };
+  for (const course of state.courses) {
+    addFor(course, course.prerequisites, 'prerequisite');
+    addFor(course, course.electivePrerequisites, 'elective');
+  }
+  return edges;
+}
+
+function pairByKey(key: string, pairs = corequisitePairs()): CorequisitePair | undefined {
+  return pairs.find(pair => pair.key === key);
+}
+
+function pairGeometry(pair: CorequisitePair): PairGeometry | null {
+  const a = state.positions[pair.aId];
+  const b = state.positions[pair.bId];
+  if (!a || !b) return null;
+  const aAbove = a.y <= b.y;
+  const upperId = aAbove ? pair.aId : pair.bId;
+  const lowerId = aAbove ? pair.bId : pair.aId;
+  const upper = state.positions[upperId];
+  const lower = state.positions[lowerId];
+  const x = upper.x + W / 2;
+  const upperBottom = upper.y + H;
+  const lowerTop = lower.y;
+  return { pair, upperId, lowerId, x, upperBottom, lowerTop, junctionY: (upperBottom + lowerTop) / 2 };
+}
+
+function buildLayoutUnits(cols: Column[], pairs: CorequisitePair[]): { columns: LayoutUnit[][]; unitByNode: Map<string, LayoutUnit> } {
+  const pairMap = new Map<string, Set<string>>();
+  for (const course of state.courses) pairMap.set(course.id, new Set([course.id]));
+  for (const pair of pairs) {
+    const merged = new Set([...(pairMap.get(pair.aId) ?? [pair.aId]), ...(pairMap.get(pair.bId) ?? [pair.bId])]);
+    for (const id of merged) pairMap.set(id, merged);
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pair of pairs) {
+      const union = new Set([...(pairMap.get(pair.aId) ?? []), ...(pairMap.get(pair.bId) ?? [])]);
+      for (const id of union) {
+        const current = pairMap.get(id) ?? new Set<string>();
+        if (current.size !== union.size || [...union].some(value => !current.has(value))) {
+          pairMap.set(id, new Set(union));
+          changed = true;
+        }
+      }
+    }
+  }
+  const unitByNode = new Map<string, LayoutUnit>();
+  const layoutColumns = cols.map((column, columnIndex) => {
+    const courses = state.courses.filter(course => course.yearLevel === column.year && course.semester === column.term);
+    const seen = new Set<string>();
+    const units: LayoutUnit[] = [];
+    for (const course of courses) {
+      if (seen.has(course.id)) continue;
+      const ids = [...(pairMap.get(course.id) ?? new Set([course.id]))]
+        .filter(id => {
+          const member = byId(id);
+          return member?.yearLevel === column.year && member?.semester === column.term;
+        })
+        .sort((a, b) => (state.positions[a]?.y ?? 0) - (state.positions[b]?.y ?? 0));
+      ids.forEach(id => seen.add(id));
+      const height = ids.length * H + Math.max(0, ids.length - 1) * COREQ_GAP;
+      const currentCenters = ids.map(id => (state.positions[id]?.y ?? TOP) + H / 2);
+      const center = currentCenters.reduce((sum, value) => sum + value, 0) / Math.max(1, currentCenters.length);
+      const unit: LayoutUnit = { key: ids.slice().sort().join('+'), ids, columnIndex, height, center };
+      units.push(unit);
+      ids.forEach(id => unitByNode.set(id, unit));
+    }
+    units.sort((a, b) => a.center - b.center);
+    return units;
+  });
+  return { columns: layoutColumns, unitByNode };
+}
+
+function sourceNodeIds(edge: DependencyEdge, pairs: CorequisitePair[]): string[] {
+  if (edge.sourceKind === 'course') return [edge.fromId];
+  const pair = pairByKey(edge.pairKey, pairs);
+  return pair ? [pair.aId, pair.bId] : [];
+}
+
+function edgeSourceUnit(edge: DependencyEdge, unitByNode: Map<string, LayoutUnit>, pairs: CorequisitePair[]): LayoutUnit | undefined {
+  return sourceNodeIds(edge, pairs).map(id => unitByNode.get(id)).find(Boolean);
+}
+
+function barycentricSortUnits(layoutColumns: LayoutUnit[][], edges: DependencyEdge[], unitByNode: Map<string, LayoutUnit>, pairs: CorequisitePair[]): void {
+  const neighborKeys = new Map<string, Set<string>>();
+  const addNeighbor = (a: string, b: string): void => {
+    const values = neighborKeys.get(a) ?? new Set<string>();
+    values.add(b);
+    neighborKeys.set(a, values);
+  };
+  for (const edge of edges) {
+    const source = edgeSourceUnit(edge, unitByNode, pairs);
+    const target = unitByNode.get(edge.toId);
+    if (!source || !target || source.key === target.key) continue;
+    addNeighbor(source.key, target.key);
+    addNeighbor(target.key, source.key);
+  }
+  const unitColumn = new Map<string, number>();
+  layoutColumns.forEach((units, columnIndex) => units.forEach(unit => unitColumn.set(unit.key, columnIndex)));
+  const ranks = (): Map<string, number> => {
+    const result = new Map<string, number>();
+    layoutColumns.forEach(units => units.forEach((unit, index) => result.set(unit.key, index)));
+    return result;
+  };
+  const sweep = (forward: boolean): void => {
+    const indices = forward
+      ? Array.from({ length: Math.max(0, layoutColumns.length - 1) }, (_, index) => index + 1)
+      : Array.from({ length: Math.max(0, layoutColumns.length - 1) }, (_, index) => layoutColumns.length - 2 - index);
+    for (const columnIndex of indices) {
+      const rank = ranks();
+      const units = layoutColumns[columnIndex];
+      const scored = units.map((unit, fallback) => {
+        const values = [...(neighborKeys.get(unit.key) ?? [])]
+          .filter(key => {
+            const neighborColumn = unitColumn.get(key);
+            return neighborColumn !== undefined && (forward ? neighborColumn < columnIndex : neighborColumn > columnIndex);
+          })
+          .map(key => rank.get(key))
+          .filter((value): value is number => value !== undefined);
+        const score = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : fallback;
+        return { unit, score, fallback };
+      });
+      scored.sort((a, b) => a.score - b.score || a.fallback - b.fallback);
+      layoutColumns[columnIndex] = scored.map(item => item.unit);
+    }
+  };
+  for (let pass = 0; pass < 10; pass += 1) {
+    sweep(true);
+    sweep(false);
+  }
+}
+
+function initializeCompactCenters(layoutColumns: LayoutUnit[][]): void {
+  for (const units of layoutColumns) {
+    let top = TOP;
+    for (const unit of units) {
+      unit.center = top + unit.height / 2;
+      top += unit.height + BASE_UNIT_GAP;
+    }
+  }
+}
+
+function placeColumnByDesired(units: LayoutUnit[], desired: Map<string, number>): void {
+  if (!units.length) return;
+  const tops: number[] = [];
+  for (let index = 0; index < units.length; index += 1) {
+    const unit = units[index];
+    const preferred = (desired.get(unit.key) ?? unit.center) - unit.height / 2;
+    const minimum = index === 0 ? TOP : tops[index - 1] + units[index - 1].height + BASE_UNIT_GAP;
+    tops[index] = Math.max(preferred, minimum);
+  }
+  for (let index = units.length - 2; index >= 0; index -= 1) {
+    const maximum = tops[index + 1] - BASE_UNIT_GAP - units[index].height;
+    const preferred = (desired.get(units[index].key) ?? units[index].center) - units[index].height / 2;
+    tops[index] = Math.max(TOP, Math.min(tops[index], maximum, Math.max(TOP, preferred)));
+  }
+  for (let index = 1; index < units.length; index += 1) {
+    tops[index] = Math.max(tops[index], tops[index - 1] + units[index - 1].height + BASE_UNIT_GAP);
+  }
+  units.forEach((unit, index) => { unit.center = tops[index] + unit.height / 2; });
+}
+
+function alignUnitCenters(layoutColumns: LayoutUnit[][], edges: DependencyEdge[], unitByNode: Map<string, LayoutUnit>, pairs: CorequisitePair[]): void {
+  const connected = new Map<string, { unit: LayoutUnit; weight: number }[]>();
+  const push = (from: LayoutUnit, to: LayoutUnit, weight: number): void => {
+    const values = connected.get(from.key) ?? [];
+    values.push({ unit: to, weight });
+    connected.set(from.key, values);
+  };
+  for (const edge of edges) {
+    const source = edgeSourceUnit(edge, unitByNode, pairs);
+    const target = unitByNode.get(edge.toId);
+    if (!source || !target || source.key === target.key) continue;
+    const span = Math.abs(source.columnIndex - target.columnIndex);
+    const weight = span === 1 ? 5 : span === 2 ? 2.5 : 1;
+    push(source, target, weight);
+    push(target, source, weight);
+  }
+  initializeCompactCenters(layoutColumns);
+  for (let pass = 0; pass < 12; pass += 1) {
+    const forward = pass % 2 === 0;
+    const columnsToPlace = forward ? layoutColumns : [...layoutColumns].reverse();
+    for (const units of columnsToPlace) {
+      const desired = new Map<string, number>();
+      for (const unit of units) {
+        const neighbors = connected.get(unit.key) ?? [];
+        if (!neighbors.length) continue;
+        let weighted = 0;
+        let weightTotal = 0;
+        for (const neighbor of neighbors) {
+          weighted += neighbor.unit.center * neighbor.weight;
+          weightTotal += neighbor.weight;
+        }
+        if (weightTotal) desired.set(unit.key, weighted / weightTotal);
+      }
+      placeColumnByDesired(units, desired);
+    }
+  }
+  const allUnits = layoutColumns.flat();
+  const minimumTop = Math.min(TOP, ...allUnits.map(unit => unit.center - unit.height / 2));
+  const shift = TOP - minimumTop;
+  if (Math.abs(shift) > 0.01) allUnits.forEach(unit => { unit.center += shift; });
+}
+
+function applyUnitPositions(layoutColumns: LayoutUnit[][], cols: Column[]): void {
+  for (const units of layoutColumns) {
+    for (const unit of units) {
+      const top = unit.center - unit.height / 2;
+      let y = top;
+      for (const id of unit.ids) {
+        state.positions[id] = { x: cols[unit.columnIndex].x, y };
+        y += H + COREQ_GAP;
+      }
+    }
+  }
+}
+
+function unitLevels(layoutColumns: LayoutUnit[][]): { levels: number[]; levelByUnit: Map<string, number> } {
+  const allUnits = layoutColumns.flat().sort((a, b) => a.center - b.center);
+  const levels: number[] = [];
+  const levelByUnit = new Map<string, number>();
+  for (const unit of allUnits) {
+    let index = levels.findIndex(value => Math.abs(value - unit.center) <= 5);
+    if (index < 0) {
+      levels.push(unit.center);
+      levels.sort((a, b) => a - b);
+      index = levels.findIndex(value => Math.abs(value - unit.center) <= 5);
+    }
+  }
+  layoutColumns.flat().forEach(unit => {
+    let best = 0;
+    let distance = Infinity;
+    levels.forEach((value, index) => {
+      const current = Math.abs(value - unit.center);
+      if (current < distance) { distance = current; best = index; }
+    });
+    levelByUnit.set(unit.key, best);
+  });
+  return { levels, levelByUnit };
+}
+
+function expandAdaptiveVerticalGaps(layoutColumns: LayoutUnit[][], edges: DependencyEdge[], unitByNode: Map<string, LayoutUnit>, pairs: CorequisitePair[]): void {
+  const { levels, levelByUnit } = unitLevels(layoutColumns);
+  if (levels.length < 2) return;
+  const demand = Array.from({ length: levels.length - 1 }, () => 0);
+  for (const edge of edges) {
+    const source = edgeSourceUnit(edge, unitByNode, pairs);
+    const target = unitByNode.get(edge.toId);
+    if (!source || !target || source.key === target.key) continue;
+    const sourceLevel = levelByUnit.get(source.key) ?? 0;
+    const targetLevel = levelByUnit.get(target.key) ?? 0;
+    const span = Math.abs(source.columnIndex - target.columnIndex);
+    if (sourceLevel === targetLevel && span === 1) continue;
+    let boundary: number;
+    if (sourceLevel === targetLevel) boundary = clamp(sourceLevel, 0, demand.length - 1);
+    else {
+      const low = Math.min(sourceLevel, targetLevel);
+      const high = Math.max(sourceLevel, targetLevel);
+      boundary = low;
+      for (let index = low; index < high; index += 1) if (demand[index] < demand[boundary]) boundary = index;
+    }
+    demand[boundary] += span > 1 ? 2 : 1;
+  }
+  const extra = demand.map(value => value ? Math.min(96, 8 + value * ROUTE_TRACK_SPACING) : 0);
+  for (const unit of layoutColumns.flat()) {
+    const level = levelByUnit.get(unit.key) ?? 0;
+    let shift = 0;
+    for (let boundary = 0; boundary < level; boundary += 1) shift += extra[boundary];
+    unit.center += shift;
+  }
+}
+
+function optimizeLayout(): void {
+  ensurePositions();
+  const cols = columns();
+  const pairs = corequisitePairs();
+  const edges = dependencyEdges(pairs);
+  const layout = buildLayoutUnits(cols, pairs);
+  barycentricSortUnits(layout.columns, edges, layout.unitByNode, pairs);
+  alignUnitCenters(layout.columns, edges, layout.unitByNode, pairs);
+  expandAdaptiveVerticalGaps(layout.columns, edges, layout.unitByNode, pairs);
+  applyUnitPositions(layout.columns, cols);
+  state.layoutMode = 'optimized';
+  rebuildOptimizedRoutes();
+  selected.clear();
+  save();
+  renderFlow();
+  requestAnimationFrame(() => requestAnimationFrame(fitView));
+  flowHint.textContent = `Auto sort aligned prerequisite chains, kept corequisite pairs together, and added vertical clearance only where routing needed it.`;
+}
+
+function edgeTargetColumn(edge: DependencyEdge, cols = columns()): number {
+  const target = byId(edge.toId);
+  return target ? columnIndexForCourse(target, cols) : -1;
+}
+
+function edgeSourceColumn(edge: DependencyEdge, pairs = corequisitePairs(), cols = columns()): number {
+  if (edge.sourceKind === 'course') {
+    const source = byId(edge.fromId);
+    return source ? columnIndexForCourse(source, cols) : -1;
+  }
+  const pair = pairByKey(edge.pairKey, pairs);
+  const source = pair && byId(pair.aId);
+  return source ? columnIndexForCourse(source, cols) : -1;
+}
+
+function courseIncidentOffset(nodeId: string, edge: DependencyEdge, edges: DependencyEdge[]): number {
+  const incident = edges.filter(item => (item.sourceKind === 'course' && item.fromId === nodeId) || item.toId === nodeId).sort((a, b) => a.key.localeCompare(b.key));
+  if (incident.length <= 1) return 0;
+  const index = Math.max(0, incident.findIndex(item => item.key === edge.key));
+  const available = Math.min(44, H - 22);
+  const step = Math.min(7, available / Math.max(1, incident.length - 1));
+  return (index - (incident.length - 1) / 2) * step;
+}
+
+function pairBranchAnchor(pair: CorequisitePair, edge: DependencyEdge, edges: DependencyEdge[]): Anchor | null {
+  const geometry = pairGeometry(pair);
+  if (!geometry) return null;
+  const branches = edges.filter(item => item.sourceKind === 'pair' && item.pairKey === pair.key).sort((a, b) => a.key.localeCompare(b.key));
+  if (branches.length <= 1) return { x: geometry.x + 4, y: geometry.junctionY };
+  const index = Math.max(0, branches.findIndex(item => item.key === edge.key));
+  const low = geometry.upperBottom + 9;
+  const high = geometry.lowerTop - 9;
+  const usableLow = Math.min(low, high);
+  const usableHigh = Math.max(low, high);
+  const y = usableLow + (index + 1) * ((usableHigh - usableLow) / (branches.length + 1));
+  return { x: geometry.x + 4, y };
+}
+
+function sourceAnchor(edge: DependencyEdge, edges: DependencyEdge[], pairs: CorequisitePair[], cols: Column[]): Anchor | null {
+  const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+  const targetColumn = edgeTargetColumn(edge, cols);
+  const forward = targetColumn >= sourceColumn;
+  if (edge.sourceKind === 'pair') {
+    const pair = pairByKey(edge.pairKey, pairs);
+    return pair ? pairBranchAnchor(pair, edge, edges) : null;
+  }
+  const position = state.positions[edge.fromId];
+  if (!position) return null;
+  return { x: forward ? position.x + W : position.x, y: position.y + H / 2 + courseIncidentOffset(edge.fromId, edge, edges) };
+}
+
+function targetAnchor(edge: DependencyEdge, edges: DependencyEdge[], pairs: CorequisitePair[], cols: Column[]): Anchor | null {
+  const target = state.positions[edge.toId];
+  if (!target) return null;
+  const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+  const targetColumn = edgeTargetColumn(edge, cols);
+  const forward = targetColumn >= sourceColumn;
+  return { x: forward ? target.x : target.x + W, y: target.y + H / 2 + courseIncidentOffset(edge.toId, edge, edges) };
+}
+
+function horizontalClear(y: number, x1: number, x2: number, excludedIds: Set<string>): boolean {
+  const left = Math.min(x1, x2) + 2;
+  const right = Math.max(x1, x2) - 2;
+  for (const course of state.courses) {
+    if (excludedIds.has(course.id)) continue;
+    const position = state.positions[course.id];
+    if (!position) continue;
+    const overlapsX = position.x - ROUTE_CLEARANCE < right && position.x + W + ROUTE_CLEARANCE > left;
+    const overlapsY = y > position.y - ROUTE_CLEARANCE && y < position.y + H + ROUTE_CLEARANCE;
+    if (overlapsX && overlapsY) return false;
+  }
+  return true;
+}
+
+function edgeExcludedIds(edge: DependencyEdge, pairs: CorequisitePair[]): Set<string> {
+  const result = new Set<string>([edge.toId]);
+  if (edge.sourceKind === 'course') result.add(edge.fromId);
+  else {
+    const pair = pairByKey(edge.pairKey, pairs);
+    if (pair) { result.add(pair.aId); result.add(pair.bId); }
+  }
+  return result;
+}
+
+function findClearCorridorY(edge: DependencyEdge, edges: DependencyEdge[], pairs: CorequisitePair[], cols: Column[], reserved: number[]): number {
+  const source = sourceAnchor(edge, edges, pairs, cols);
+  const target = targetAnchor(edge, edges, pairs, cols);
+  if (!source || !target) return TOP - 20;
+  const excluded = edgeExcludedIds(edge, pairs);
+  const maxBottom = Math.max(TOP + H, ...Object.values(state.positions).map(position => position.y + H));
+  const candidates: number[] = [];
+  const occupied = state.courses
+    .filter(course => !excluded.has(course.id))
+    .map(course => state.positions[course.id])
+    .filter((position): position is NodePosition => Boolean(position))
+    .sort((a, b) => a.y - b.y);
+  candidates.push(TOP - 18);
+  for (let index = 0; index < occupied.length - 1; index += 1) {
+    const gapTop = occupied[index].y + H + ROUTE_CLEARANCE;
+    const gapBottom = occupied[index + 1].y - ROUTE_CLEARANCE;
+    if (gapBottom - gapTop >= ROUTE_TRACK_SPACING * 2) candidates.push((gapTop + gapBottom) / 2);
+  }
+  candidates.push(maxBottom + 24);
+  candidates.sort((a, b) => Math.abs(a - (source.y + target.y) / 2) - Math.abs(b - (source.y + target.y) / 2));
+  for (const candidate of candidates) {
+    if (reserved.some(value => Math.abs(value - candidate) < ROUTE_TRACK_SPACING)) continue;
+    if (horizontalClear(candidate, source.x, target.x, excluded)) return candidate;
+  }
+  let fallback = maxBottom + 24;
+  while (reserved.some(value => Math.abs(value - fallback) < ROUTE_TRACK_SPACING)) fallback += ROUTE_TRACK_SPACING;
+  return fallback;
+}
+
+function rebuildOptimizedRoutes(): void {
+  if (state.layoutMode !== 'optimized') { routePlans = null; return; }
+  const cols = columns();
+  const pairs = corequisitePairs();
+  const edges = dependencyEdges(pairs);
+  const plans = new Map<string, RoutePlan>();
+  const adjacentGroups = new Map<string, DependencyEdge[]>();
+  const sameColumnGroups = new Map<number, DependencyEdge[]>();
+  const corridorEdges: DependencyEdge[] = [];
+  for (const edge of edges) {
+    const source = sourceAnchor(edge, edges, pairs, cols);
+    const target = targetAnchor(edge, edges, pairs, cols);
+    const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+    const targetColumn = edgeTargetColumn(edge, cols);
+    if (!source || !target || sourceColumn < 0 || targetColumn < 0) continue;
+    const excluded = edgeExcludedIds(edge, pairs);
+    if (Math.abs(source.y - target.y) <= 1.5 && horizontalClear(source.y, source.x, target.x, excluded)) {
+      plans.set(edge.key, { kind: 'straight' });
+      continue;
+    }
+    const span = Math.abs(targetColumn - sourceColumn);
+    if (span === 0) {
+      const group = sameColumnGroups.get(sourceColumn) ?? [];
+      group.push(edge);
+      sameColumnGroups.set(sourceColumn, group);
+    } else if (span === 1) {
+      const key = `${Math.min(sourceColumn, targetColumn)}:${Math.max(sourceColumn, targetColumn)}`;
+      const group = adjacentGroups.get(key) ?? [];
+      group.push(edge);
+      adjacentGroups.set(key, group);
+    } else corridorEdges.push(edge);
+  }
+  for (const [columnIndex, group] of sameColumnGroups) {
+    group.sort((a, b) => a.key.localeCompare(b.key));
+    group.forEach((edge, index) => {
+      const laneX = cols[columnIndex].x + W + 24 + index * ROUTE_TRACK_SPACING;
+      plans.set(edge.key, { kind: 'adjacent', laneX });
+    });
+  }
+  for (const [key, group] of adjacentGroups) {
+    const [leftText, rightText] = key.split(':');
+    const left = Number(leftText);
+    const right = Number(rightText);
+    const gapStart = cols[left].x + W;
+    const gapEnd = cols[right].x;
+    group.sort((a, b) => {
+      const aa = sourceAnchor(a, edges, pairs, cols);
+      const ab = targetAnchor(a, edges, pairs, cols);
+      const ba = sourceAnchor(b, edges, pairs, cols);
+      const bb = targetAnchor(b, edges, pairs, cols);
+      return ((aa?.y ?? 0) + (ab?.y ?? 0)) - ((ba?.y ?? 0) + (bb?.y ?? 0)) || a.key.localeCompare(b.key);
+    });
+    group.forEach((edge, index) => {
+      const laneX = gapStart + (index + 1) * ((gapEnd - gapStart) / (group.length + 1));
+      plans.set(edge.key, { kind: 'adjacent', laneX });
+    });
+  }
+  const reservedY: number[] = [];
+  corridorEdges.sort((a, b) => a.key.localeCompare(b.key));
+  for (const edge of corridorEdges) {
+    const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+    const targetColumn = edgeTargetColumn(edge, cols);
+    const forward = targetColumn > sourceColumn;
+    const sourceNeighbor = clamp(sourceColumn + (forward ? 1 : -1), 0, cols.length - 1);
+    const targetNeighbor = clamp(targetColumn + (forward ? -1 : 1), 0, cols.length - 1);
+    const sourceLaneX = forward
+      ? (cols[sourceColumn].x + W + cols[sourceNeighbor].x) / 2
+      : (cols[sourceNeighbor].x + W + cols[sourceColumn].x) / 2;
+    const targetLaneX = forward
+      ? (cols[targetNeighbor].x + W + cols[targetColumn].x) / 2
+      : (cols[targetColumn].x + W + cols[targetNeighbor].x) / 2;
+    const corridorY = findClearCorridorY(edge, edges, pairs, cols, reservedY);
+    reservedY.push(corridorY);
+    plans.set(edge.key, { kind: 'corridor', sourceLaneX, targetLaneX, corridorY });
+  }
+  routePlans = plans;
+}
+
+function genericEdgePath(edge: DependencyEdge, edges: DependencyEdge[], pairs: CorequisitePair[], cols: Column[]): string {
+  const source = sourceAnchor(edge, edges, pairs, cols);
+  const target = targetAnchor(edge, edges, pairs, cols);
+  if (!source || !target) return '';
+  const middle = source.x + (target.x - source.x) / 2;
+  return `M ${source.x} ${source.y} H ${middle} V ${target.y} H ${target.x}`;
+}
+
+function edgePath(edge: DependencyEdge, edges: DependencyEdge[], pairs: CorequisitePair[], cols: Column[]): string {
+  const source = sourceAnchor(edge, edges, pairs, cols);
+  const target = targetAnchor(edge, edges, pairs, cols);
+  if (!source || !target) return '';
+  const plan = routePlans?.get(edge.key);
+  if (!plan) return genericEdgePath(edge, edges, pairs, cols);
+  if (plan.kind === 'straight') return `M ${source.x} ${source.y} H ${target.x}`;
+  if (plan.kind === 'adjacent') return `M ${source.x} ${source.y} H ${plan.laneX} V ${target.y} H ${target.x}`;
+  return `M ${source.x} ${source.y} H ${plan.sourceLaneX} V ${plan.corridorY} H ${plan.targetLaneX} V ${target.y} H ${target.x}`;
 }
 
 function autoLayout(): void {
-  invalidateOptimizedRouting();
-  columns().forEach(column => {
+  setBasicRouting();
+  const cols = columns();
+  cols.forEach(column => {
     state.courses.filter(course => course.yearLevel === column.year && course.semester === column.term).forEach((course, index) => {
       state.positions[course.id] = { x: column.x, y: TOP + index * (H + GAP) };
     });
   });
+  const pairs = corequisitePairs();
+  const layout = buildLayoutUnits(cols, pairs);
+  initializeCompactCenters(layout.columns);
+  applyUnitPositions(layout.columns, cols);
   save();
   renderFlow();
 }
 
 function renderTable(): void {
   const needle = norm(search.value);
-  const courses = state.courses.filter(course => !needle || [
-    course.yearLevel,
-    course.semester,
-    course.courseNo,
-    course.title,
-    ...course.prerequisites,
-    ...course.corequisites,
-    ...course.electivePrerequisites,
-    ...course.otherRequirements,
-  ].some(value => norm(value).includes(needle)));
-
+  const courses = state.courses.filter(course => !needle || [course.yearLevel, course.semester, course.courseNo, course.title, ...course.prerequisites, ...course.corequisites, ...course.electivePrerequisites, ...course.otherRequirements].some(value => norm(value).includes(needle)));
   tbody.innerHTML = courses.map(course => `
     <tr data-id="${course.id}">
       <td data-label="Year Level"><input class="table-input wide-input" data-f="yearLevel" list="year-options" value="${esc(course.yearLevel)}" aria-label="${esc(course.courseNo)} year level"></td>
@@ -183,11 +778,10 @@ function renderTable(): void {
 function updateField(id: string, field: keyof CurriculumCourse, value: string, oldCode?: string): void {
   const course = byId(id);
   if (!course) return;
-  invalidateOptimizedRouting();
-
+  const topologyChanged = field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'yearLevel' || field === 'semester' || field === 'courseNo';
+  if (topologyChanged) setBasicRouting();
   if (field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'otherRequirements') course[field] = list(value);
   else if (field === 'yearLevel' || field === 'semester' || field === 'courseNo' || field === 'title' || field === 'units') course[field] = value;
-
   if (field === 'courseNo' && oldCode && norm(oldCode) !== norm(value)) {
     const replace = (items: string[]): string[] => items.map(item => norm(item) === norm(oldCode) ? value : item);
     state.courses.forEach(item => {
@@ -196,27 +790,16 @@ function updateField(id: string, field: keyof CurriculumCourse, value: string, o
       item.electivePrerequisites = replace(item.electivePrerequisites);
     });
   }
-
   if (field === 'yearLevel' || field === 'semester') state.positions[id] = defaultPos(course);
+  ensurePositions();
   save();
   renderFlow();
 }
 
 function addCourse(): void {
-  invalidateOptimizedRouting();
+  setBasicRouting();
   const id = `course-${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
-  const course: CurriculumCourse = {
-    id,
-    yearLevel: 'First Year',
-    semester: 'First Semester',
-    courseNo: `NEW ${state.courses.length + 1}`,
-    title: 'New Course',
-    units: '3',
-    prerequisites: [],
-    corequisites: [],
-    electivePrerequisites: [],
-    otherRequirements: [],
-  };
+  const course: CurriculumCourse = { id, yearLevel: 'First Year', semester: 'First Semester', courseNo: `NEW ${state.courses.length + 1}`, title: 'New Course', units: '3', prerequisites: [], corequisites: [], electivePrerequisites: [], otherRequirements: [] };
   state.courses.push(course);
   state.positions[id] = defaultPos(course);
   save();
@@ -227,7 +810,7 @@ function addCourse(): void {
 function deleteCourse(id: string): void {
   const course = byId(id);
   if (!course || !confirm(`Delete ${course.courseNo}? Related references will also be removed.`)) return;
-  invalidateOptimizedRouting();
+  setBasicRouting();
   state.courses = state.courses.filter(item => item.id !== id);
   delete state.positions[id];
   selected.delete(id);
@@ -242,10 +825,7 @@ function deleteCourse(id: string): void {
   renderFlow();
 }
 
-function yearClass(year: string): string {
-  return `year-${(years().indexOf(year) % 4) + 1}`;
-}
-
+function yearClass(year: string): string { return `year-${(years().indexOf(year) % 4) + 1}`; }
 function termClass(term: string): string {
   const value = norm(term);
   if (value.includes('first')) return 'term-first';
@@ -254,252 +834,13 @@ function termClass(term: string): string {
   return 'term-other';
 }
 
-function relationships(): Relationship[] {
-  const result: Relationship[] = [];
-  const seen = new Set<string>();
-  const add = (code: string, toId: string, type: Relationship['type']): void => {
-    const from = byCode(code);
-    if (!from || from.id === toId) return;
-    const key = `${from.id}|${toId}|${type}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      result.push({ fromId: from.id, toId, type });
-    }
-  };
-  state.courses.forEach(course => {
-    course.prerequisites.forEach(code => add(code, course.id, 'prerequisite'));
-    course.corequisites.forEach(code => add(code, course.id, 'corequisite'));
-    course.electivePrerequisites.forEach(code => add(code, course.id, 'elective'));
-  });
-  return result;
-}
-
-function relationshipKey(relationship: Relationship): string {
-  return `${relationship.fromId}|${relationship.toId}|${relationship.type}`;
-}
-
-function barycentricSort(columnLists: string[][], rels: Relationship[], courseColumns: Map<string, number>): void {
-  const neighbors = new Map<string, string[]>();
-  for (const relationship of rels) {
-    const from = neighbors.get(relationship.fromId) ?? [];
-    from.push(relationship.toId);
-    neighbors.set(relationship.fromId, from);
-    const to = neighbors.get(relationship.toId) ?? [];
-    to.push(relationship.fromId);
-    neighbors.set(relationship.toId, to);
-  }
-
-  const rankMap = (): Map<string, number> => {
-    const result = new Map<string, number>();
-    columnLists.forEach(list => list.forEach((id, index) => result.set(id, index)));
-    return result;
-  };
-
-  const sweep = (forward: boolean): void => {
-    const indices = forward
-      ? Array.from({ length: Math.max(0, columnLists.length - 1) }, (_, i) => i + 1)
-      : Array.from({ length: Math.max(0, columnLists.length - 1) }, (_, i) => columnLists.length - 2 - i);
-
-    for (const columnIndex of indices) {
-      const ranks = rankMap();
-      const current = columnLists[columnIndex];
-      const scored = current.map((id, fallback) => {
-        const relevant = (neighbors.get(id) ?? []).filter(neighborId => {
-          const neighborColumn = courseColumns.get(neighborId);
-          return neighborColumn !== undefined && (forward ? neighborColumn < columnIndex : neighborColumn > columnIndex);
-        });
-        const values = relevant.map(neighborId => ranks.get(neighborId)).filter((value): value is number => value !== undefined);
-        const score = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : fallback;
-        return { id, score, fallback };
-      });
-      scored.sort((a, b) => a.score - b.score || a.fallback - b.fallback);
-      columnLists[columnIndex] = scored.map(item => item.id);
-    }
-  };
-
-  for (let pass = 0; pass < 8; pass += 1) {
-    sweep(true);
-    sweep(false);
-  }
-}
-
-function incidentPortOffset(nodeId: string, relationship: Relationship, rels: Relationship[]): number {
-  const incident = rels
-    .filter(item => item.fromId === nodeId || item.toId === nodeId)
-    .sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
-  if (incident.length <= 1) return 0;
-  const index = Math.max(0, incident.findIndex(item => relationshipKey(item) === relationshipKey(relationship)));
-  const available = Math.min(42, H - 24);
-  const step = Math.min(8, available / Math.max(1, incident.length - 1));
-  return (index - (incident.length - 1) / 2) * step;
-}
-
-function optimizeLayout(): void {
-  ensurePositions();
-  const cols = columns();
-  const rels = relationships();
-  const columnLists = cols.map(column => state.courses
-    .filter(course => course.yearLevel === column.year && course.semester === column.term)
-    .sort((a, b) => (state.positions[a.id]?.y ?? 0) - (state.positions[b.id]?.y ?? 0))
-    .map(course => course.id));
-  const courseColumns = new Map<string, number>();
-  columnLists.forEach((ids, columnIndex) => ids.forEach(id => courseColumns.set(id, columnIndex)));
-  barycentricSort(columnLists, rels, courseColumns);
-
-  const rowById = new Map<string, number>();
-  columnLists.forEach(ids => ids.forEach((id, row) => rowById.set(id, row)));
-  const maxRows = Math.max(1, ...columnLists.map(ids => ids.length));
-  const longEdges = rels.filter(relationship => {
-    const fromColumn = courseColumns.get(relationship.fromId);
-    const toColumn = courseColumns.get(relationship.toId);
-    return fromColumn !== undefined && toColumn !== undefined && Math.abs(toColumn - fromColumn) > 1;
-  });
-
-  const channels = Array.from({ length: maxRows }, () => [] as Relationship[]);
-  for (const relationship of longEdges) {
-    const fromRow = rowById.get(relationship.fromId) ?? 0;
-    const toRow = rowById.get(relationship.toId) ?? 0;
-    let channel = toRow > fromRow ? fromRow : toRow < fromRow ? Math.max(0, fromRow - 1) : fromRow;
-    channel = clamp(channel, 0, maxRows - 1);
-    channels[channel].push(relationship);
-  }
-
-  const gapAfter = channels.map(items => OPT_BASE_GAP + items.length * OPT_TRACK_SPACING);
-  const rowY: number[] = [TOP];
-  for (let row = 0; row < maxRows - 1; row += 1) {
-    rowY[row + 1] = rowY[row] + H + gapAfter[row];
-  }
-
-  columnLists.forEach((ids, columnIndex) => ids.forEach((id, row) => {
-    state.positions[id] = { x: cols[columnIndex].x, y: rowY[row] };
-  }));
-
-  const routes = new Map<string, OptimizedRoute>();
-  const adjacentGroups = new Map<string, Relationship[]>();
-  const sameColumnGroups = new Map<number, Relationship[]>();
-
-  for (const relationship of rels) {
-    const fromColumn = courseColumns.get(relationship.fromId);
-    const toColumn = courseColumns.get(relationship.toId);
-    if (fromColumn === undefined || toColumn === undefined) continue;
-    const span = Math.abs(toColumn - fromColumn);
-    if (span === 0) {
-      const group = sameColumnGroups.get(fromColumn) ?? [];
-      group.push(relationship);
-      sameColumnGroups.set(fromColumn, group);
-    } else if (span === 1) {
-      const key = `${Math.min(fromColumn, toColumn)}:${Math.max(fromColumn, toColumn)}`;
-      const group = adjacentGroups.get(key) ?? [];
-      group.push(relationship);
-      adjacentGroups.set(key, group);
-    }
-  }
-
-  for (const [columnIndex, group] of sameColumnGroups) {
-    group.sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
-    group.forEach((relationship, index) => {
-      const from = state.positions[relationship.fromId];
-      const to = state.positions[relationship.toId];
-      if (!from || !to) return;
-      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
-      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
-      const right = cols[columnIndex].x + W + 14 + index * 6;
-      routes.set(relationshipKey(relationship), { d: `M ${from.x + W} ${fromY} H ${right} V ${toY} H ${to.x + W}` });
-    });
-  }
-
-  for (const [key, group] of adjacentGroups) {
-    const [leftIndexText] = key.split(':');
-    const leftIndex = Number(leftIndexText);
-    const gapStart = cols[leftIndex].x + W;
-    const gapEnd = cols[leftIndex + 1].x;
-    group.sort((a, b) => {
-      const ay = (state.positions[a.fromId]?.y ?? 0) + (state.positions[a.toId]?.y ?? 0);
-      const by = (state.positions[b.fromId]?.y ?? 0) + (state.positions[b.toId]?.y ?? 0);
-      return ay - by || relationshipKey(a).localeCompare(relationshipKey(b));
-    });
-    group.forEach((relationship, index) => {
-      const from = state.positions[relationship.fromId];
-      const to = state.positions[relationship.toId];
-      const fromColumn = courseColumns.get(relationship.fromId)!;
-      const toColumn = courseColumns.get(relationship.toId)!;
-      if (!from || !to) return;
-      const laneX = gapStart + 8 + (index + 1) * Math.max(2, (gapEnd - gapStart - 16) / (group.length + 1));
-      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
-      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
-      const forward = toColumn > fromColumn;
-      const startX = forward ? from.x + W : from.x;
-      const endX = forward ? to.x : to.x + W;
-      routes.set(relationshipKey(relationship), { d: `M ${startX} ${fromY} H ${laneX} V ${toY} H ${endX}` });
-    });
-  }
-
-  channels.forEach((group, channel) => {
-    group.sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
-    group.forEach((relationship, index) => {
-      const from = state.positions[relationship.fromId];
-      const to = state.positions[relationship.toId];
-      const fromColumn = courseColumns.get(relationship.fromId)!;
-      const toColumn = courseColumns.get(relationship.toId)!;
-      if (!from || !to) return;
-      const laneTop = rowY[channel] + H;
-      const laneY = laneTop + OPT_TRACK_SPACING * (index + 1);
-      const forward = toColumn > fromColumn;
-      const sourceNeighbor = clamp(fromColumn + (forward ? 1 : -1), 0, cols.length - 1);
-      const targetNeighbor = clamp(toColumn + (forward ? -1 : 1), 0, cols.length - 1);
-      const sourceGapX = (forward
-        ? cols[fromColumn].x + W + cols[sourceNeighbor].x
-        : cols[sourceNeighbor].x + W + cols[fromColumn].x) / 2;
-      const targetGapX = (forward
-        ? cols[targetNeighbor].x + W + cols[toColumn].x
-        : cols[toColumn].x + W + cols[targetNeighbor].x) / 2;
-      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
-      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
-      const startX = forward ? from.x + W : from.x;
-      const endX = forward ? to.x : to.x + W;
-      routes.set(relationshipKey(relationship), { d: `M ${startX} ${fromY} H ${sourceGapX} V ${laneY} H ${targetGapX} V ${toY} H ${endX}` });
-    });
-  });
-
-  optimizedRoutes = routes;
-  selected.clear();
-  save();
-  renderFlow();
-  requestAnimationFrame(() => requestAnimationFrame(fitView));
-  flowHint.textContent = `Optimized ${rels.length} connections. Semester columns stayed fixed; vertical row spacing expanded where routing tracks needed clearance.`;
-}
-
-function genericEdgePath(relationship: Relationship): string {
-  const from = state.positions[relationship.fromId];
-  const to = state.positions[relationship.toId];
-  if (!from || !to) return '';
-  const fromY = from.y + H / 2;
-  const toY = to.y + H / 2;
-
-  if (relationship.type === 'corequisite' && Math.abs(from.x - to.x) < COL / 2) {
-    const lane = Math.max(from.x, to.x) + W + 18;
-    return `M ${from.x + W} ${fromY} H ${lane} V ${toY} H ${to.x + W}`;
-  }
-  if (to.x >= from.x) {
-    const startX = from.x + W;
-    const middle = startX + Math.max(18, (to.x - startX) / 2);
-    return `M ${startX} ${fromY} H ${middle} V ${toY} H ${to.x}`;
-  }
-  const endX = to.x + W;
-  const middle = endX + Math.max(18, (from.x - endX) / 2);
-  return `M ${from.x} ${fromY} H ${middle} V ${toY} H ${endX}`;
-}
-
-function edgePath(relationship: Relationship): string {
-  return optimizedRoutes?.get(relationshipKey(relationship))?.d ?? genericEdgePath(relationship);
-}
-
 function updateCanvasSize(): void {
   const cols = columns();
-  const maxNodeX = Math.max(0, ...Object.values(state.positions).map(position => position.x + W + 80));
+  const maxNodeX = Math.max(0, ...Object.values(state.positions).map(position => position.x + W + 100));
   const maxNodeY = Math.max(0, ...Object.values(state.positions).map(position => position.y + H + 120));
+  const routeMaxY = routePlans ? Math.max(0, ...[...routePlans.values()].map(plan => plan.corridorY ?? 0)) + 70 : 0;
   logicalWidth = Math.max(920, cols.length * COL + 70, maxNodeX);
-  logicalHeight = Math.max(620, maxNodeY);
+  logicalHeight = Math.max(620, maxNodeY, routeMaxY);
   canvas.style.width = `${logicalWidth}px`;
   canvas.style.height = `${logicalHeight}px`;
   svg.setAttribute('viewBox', `0 0 ${logicalWidth} ${logicalHeight}`);
@@ -509,64 +850,85 @@ function updateCanvasSize(): void {
 
 function renderFlow(): void {
   ensurePositions();
+  if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
   const cols = columns();
   updateCanvasSize();
-
   headers.innerHTML = years().map(year => {
     const yearColumns = cols.filter(column => column.year === year);
     if (!yearColumns.length) return '';
     const width = yearColumns[yearColumns.length - 1].x - yearColumns[0].x + W;
     return `<div class="year-header ${yearClass(year)}" style="left:${yearColumns[0].x}px;width:${width}px">${esc(year.toUpperCase())}</div>`;
   }).join('') + cols.map(column => `<div class="term-header ${yearClass(column.year)} ${termClass(column.term)}" style="left:${column.x}px;width:${W}px">${esc(column.term)}</div>`).join('');
-
   nodes.innerHTML = state.courses.map(course => {
     const position = state.positions[course.id];
     return `<article class="course-node ${yearClass(course.yearLevel)} ${termClass(course.semester)}${selected.has(course.id) ? ' selected' : ''}" data-id="${course.id}" style="left:${position.x}px;top:${position.y}px" tabindex="0" role="button" aria-label="${esc(`${course.courseNo}, ${course.title}`)}"><div class="node-code">${esc(course.courseNo || 'Untitled')}</div><div class="node-title">${esc(course.title || 'No descriptive title')}</div><div class="node-meta">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}</div></article>`;
   }).join('');
-
   renderEdges();
   updateSelection();
   applyViewportTransform();
 }
 
+function corequisiteMarkup(pair: CorequisitePair, exportMode = false): string {
+  const geometry = pairGeometry(pair);
+  if (!geometry) return '';
+  const xLeft = geometry.x - 3.5;
+  const xRight = geometry.x + 3.5;
+  const marker = exportMode ? 'export-coreq-arrow' : 'coreq-arrow';
+  const className = exportMode ? '' : ' class="corequisite-line"';
+  const stroke = exportMode ? ' stroke="#58677d" stroke-width="1.8"' : '';
+  const upperToLower = `<path d="M ${xLeft} ${geometry.upperBottom} V ${geometry.lowerTop}"${className}${stroke} marker-end="url(#${marker})"/>`;
+  const lowerToUpper = `<path d="M ${xRight} ${geometry.lowerTop} V ${geometry.upperBottom}"${className}${stroke} marker-end="url(#${marker})"/>`;
+  return upperToLower + lowerToUpper;
+}
+
 function renderEdges(): void {
-  svg.innerHTML = `<defs><marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" class="arrowhead-shape"></path></marker></defs>` + relationships().map(relationship => `<path d="${edgePath(relationship)}" class="relationship relationship-${relationship.type}"${relationship.type === 'corequisite' ? '' : ' marker-end="url(#arrowhead)"'}></path>`).join('');
+  const pairs = corequisitePairs();
+  const edges = dependencyEdges(pairs);
+  const cols = columns();
+  const defs = `<defs><marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" class="arrowhead-shape"></path></marker><marker id="coreq-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L7 3.5 L0 7z" class="coreq-arrowhead-shape"></path></marker></defs>`;
+  const coreq = pairs.map(pair => corequisiteMarkup(pair)).join('');
+  const deps = edges.map(edge => `<path d="${edgePath(edge, edges, pairs, cols)}" class="relationship relationship-${edge.type}${edge.sourceKind === 'pair' ? ' relationship-from-coreq' : ''}" marker-end="url(#arrowhead)"></path>`).join('');
+  svg.innerHTML = defs + coreq + deps;
 }
 
 function updateSelection(): void {
   nodes.querySelectorAll<HTMLElement>('.course-node').forEach(node => node.classList.toggle('selected', selected.has(node.dataset.id!)));
   const amount = selected.size;
   selectionStatus.textContent = amount ? `${amount} course${amount === 1 ? '' : 's'} selected` : 'No courses selected';
-
-  if (multiSelect) flowHint.textContent = 'Multi-select is on. Tap courses to add/remove them; drag selected courses together.';
-  else if (amount >= 2) flowHint.textContent = 'Alignment tools apply to the selected courses. Pinch to zoom or drag empty space to pan.';
+  if (multiSelect) flowHint.textContent = 'Multi-select is on. Tap courses to add/remove them; corequisite partners move together.';
+  else if (state.layoutMode === 'optimized') flowHint.textContent = 'Optimized routing stays active while you move nodes. Corequisite pairs remain vertically coupled.';
+  else if (amount >= 2) flowHint.textContent = 'Alignment tools apply to selected courses. Pinch to zoom or drag empty space to pan.';
   else flowHint.textContent = 'Tap a course to select. Drag empty space to pan. Pinch with two fingers to zoom.';
+  document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => { button.disabled = button.dataset.align?.startsWith('distribute') ? amount < 3 : amount < 2; });
+}
 
-  document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => {
-    button.disabled = button.dataset.align?.startsWith('distribute') ? amount < 3 : amount < 2;
-  });
+function expandedSelectionForCorequisites(ids: Iterable<string>): Set<string> {
+  const result = new Set(ids);
+  const pairs = corequisitePairs();
+  for (const id of [...result]) corequisiteComponentIds(id, pairs).forEach(member => result.add(member));
+  return result;
+}
+
+function afterManualPositionChange(): void {
+  if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
+  else routePlans = null;
 }
 
 function align(action: AlignmentAction): void {
-  const items = [...selected].map(id => ({ id, position: state.positions[id] })).filter(item => item.position) as { id: string; position: NodePosition }[];
+  const workingSelection = state.layoutMode === 'optimized' ? expandedSelectionForCorequisites(selected) : new Set(selected);
+  const items = [...workingSelection].map(id => ({ id, position: state.positions[id] })).filter(item => item.position) as { id: string; position: NodePosition }[];
   if (items.length < 2) return;
-  invalidateOptimizedRouting();
-
   const left = Math.min(...items.map(item => item.position.x));
   const right = Math.max(...items.map(item => item.position.x + W));
   const top = Math.min(...items.map(item => item.position.y));
   const bottom = Math.max(...items.map(item => item.position.y + H));
-
   if (action.startsWith('distribute') && items.length >= 3) {
     const horizontal = action === 'distribute-horizontal';
     items.sort((a, b) => horizontal ? a.position.x - b.position.x : a.position.y - b.position.y);
     const first = horizontal ? items[0].position.x : items[0].position.y;
     const last = horizontal ? items.at(-1)!.position.x : items.at(-1)!.position.y;
     const step = (last - first) / (items.length - 1);
-    items.forEach((item, index) => {
-      if (horizontal) item.position.x = first + step * index;
-      else item.position.y = first + step * index;
-    });
+    items.forEach((item, index) => { if (horizontal) item.position.x = first + step * index; else item.position.y = first + step * index; });
   } else {
     items.forEach(item => {
       if (action === 'left') item.position.x = left;
@@ -577,25 +939,22 @@ function align(action: AlignmentAction): void {
       if (action === 'bottom') item.position.y = bottom - H;
     });
   }
-
-  if (state.snapToGrid) items.forEach(item => {
-    item.position.x = Math.round(item.position.x / GRID) * GRID;
-    item.position.y = Math.round(item.position.y / GRID) * GRID;
-  });
-
+  if (state.snapToGrid) items.forEach(item => { item.position.x = Math.round(item.position.x / GRID) * GRID; item.position.y = Math.round(item.position.y / GRID) * GRID; });
+  afterManualPositionChange();
   save();
   renderFlow();
 }
 
 function alignToTerms(): void {
-  invalidateOptimizedRouting();
   const cols = columns();
-  selected.forEach(id => {
+  const workingSelection = state.layoutMode === 'optimized' ? expandedSelectionForCorequisites(selected) : new Set(selected);
+  workingSelection.forEach(id => {
     const course = byId(id);
     const position = state.positions[id];
     const column = course && cols.find(item => item.year === course.yearLevel && item.term === course.semester);
     if (position && column) position.x = column.x;
   });
+  afterManualPositionChange();
   save();
   renderFlow();
 }
@@ -631,6 +990,7 @@ function fitView(): void {
   const width = viewport.clientWidth;
   const height = viewport.clientHeight;
   if (!width || !height) return;
+  updateCanvasSize();
   const padding = width < 600 ? 18 : 34;
   const scale = clamp(Math.min((width - padding * 2) / logicalWidth, (height - padding * 2) / logicalHeight), MIN_SCALE, 1.2);
   state.viewport.scale = scale;
@@ -640,11 +1000,7 @@ function fitView(): void {
   save();
 }
 
-function resetView(): void {
-  state.viewport = { ...DEFAULT_VIEWPORT };
-  applyViewportTransform();
-  save();
-}
+function resetView(): void { state.viewport = { ...DEFAULT_VIEWPORT }; applyViewportTransform(); save(); }
 
 function switchView(view: 'table' | 'flow'): void {
   tablePanel.hidden = view !== 'table';
@@ -663,10 +1019,8 @@ function locate(id: string): void {
   requestAnimationFrame(() => {
     const position = state.positions[id];
     if (!position) return;
-    const width = viewport.clientWidth;
-    const height = viewport.clientHeight;
-    state.viewport.x = width / 2 - (position.x + W / 2) * state.viewport.scale;
-    state.viewport.y = height / 2 - (position.y + H / 2) * state.viewport.scale;
+    state.viewport.x = viewport.clientWidth / 2 - (position.x + W / 2) * state.viewport.scale;
+    state.viewport.y = viewport.clientHeight / 2 - (position.y + H / 2) * state.viewport.scale;
     applyViewportTransform();
     updateSelection();
     save();
@@ -680,9 +1034,7 @@ function setMultiSelect(enabled: boolean): void {
   updateSelection();
 }
 
-function pointDistance(a: PointerPoint, b: PointerPoint): number {
-  return Math.hypot(a.x - b.x, a.y - b.y);
-}
+function pointDistance(a: PointerPoint, b: PointerPoint): number { return Math.hypot(a.x - b.x, a.y - b.y); }
 
 function beginPinch(): void {
   const entries = [...activePointers.entries()].slice(0, 2);
@@ -694,16 +1046,7 @@ function beginPinch(): void {
   const middleX = (p1.x + p2.x) / 2;
   const middleY = (p1.y + p2.y) / 2;
   const rect = viewport.getBoundingClientRect();
-  const localX = middleX - rect.left;
-  const localY = middleY - rect.top;
-  gesture = {
-    kind: 'pinch',
-    pointerIds: [first[0], second[0]],
-    startDistance: distance,
-    startScale: state.viewport.scale,
-    focalX: (localX - state.viewport.x) / state.viewport.scale,
-    focalY: (localY - state.viewport.y) / state.viewport.scale,
-  };
+  gesture = { kind: 'pinch', pointerIds: [first[0], second[0]], startDistance: distance, startScale: state.viewport.scale, focalX: (middleX - rect.left - state.viewport.x) / state.viewport.scale, focalY: (middleY - rect.top - state.viewport.y) / state.viewport.scale };
   nodes.querySelectorAll('.dragging').forEach(element => element.classList.remove('dragging'));
   viewport.classList.add('panning');
 }
@@ -713,38 +1056,30 @@ function pointerDown(event: PointerEvent): void {
   event.preventDefault();
   viewport.focus({ preventScroll: true });
   activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-  try { viewport.setPointerCapture(event.pointerId); } catch { /* capture is optional */ }
-
-  if (activePointers.size >= 2) {
-    beginPinch();
+  try { viewport.setPointerCapture(event.pointerId); } catch { /* optional */ }
+  if (activePointers.size >= 2) { beginPinch(); return; }
+  const node = (event.target as HTMLElement).closest<HTMLElement>('.course-node');
+  if (!node) {
+    gesture = { kind: 'pan', pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startPanX: state.viewport.x, startPanY: state.viewport.y, moved: false };
     return;
   }
-
-  const node = (event.target as HTMLElement).closest<HTMLElement>('.course-node');
-  if (node) {
-    const id = node.dataset.id!;
-    const additive = multiSelect || event.shiftKey || event.ctrlKey || event.metaKey;
-    const wasSelected = selected.has(id);
-    if (!wasSelected) {
-      if (!additive) selected.clear();
-      selected.add(id);
-      updateSelection();
-    }
-    const starts = new Map<string, NodePosition>();
-    selected.forEach(selectedId => {
-      const position = state.positions[selectedId];
-      if (position) starts.set(selectedId, { ...position });
-    });
-    gesture = { kind: 'node', pointerId: event.pointerId, nodeId: id, startX: event.clientX, startY: event.clientY, starts, additive, wasSelected, moved: false };
-  } else {
-    gesture = { kind: 'pan', pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, startPanX: state.viewport.x, startPanY: state.viewport.y, moved: false };
+  const id = node.dataset.id!;
+  const additive = multiSelect || event.shiftKey || event.ctrlKey || event.metaKey;
+  const wasSelected = selected.has(id);
+  if (!wasSelected) {
+    if (!additive) selected.clear();
+    selected.add(id);
+    updateSelection();
   }
+  const dragIds = expandedSelectionForCorequisites(selected.has(id) ? selected : [id]);
+  const starts = new Map<string, NodePosition>();
+  dragIds.forEach(dragId => { const position = state.positions[dragId]; if (position) starts.set(dragId, { ...position }); });
+  gesture = { kind: 'node', pointerId: event.pointerId, nodeId: id, startX: event.clientX, startY: event.clientY, starts, additive, wasSelected, moved: false };
 }
 
 function pointerMove(event: PointerEvent): void {
   if (!activePointers.has(event.pointerId)) return;
   activePointers.set(event.pointerId, { x: event.clientX, y: event.clientY });
-
   if (activePointers.size >= 2) {
     if (gesture?.kind !== 'pinch') beginPinch();
     if (gesture?.kind !== 'pinch') return;
@@ -762,12 +1097,10 @@ function pointerMove(event: PointerEvent): void {
     applyViewportTransform();
     return;
   }
-
   if (!gesture || gesture.kind === 'pinch' || gesture.pointerId !== event.pointerId) return;
   const deltaX = event.clientX - gesture.startX;
   const deltaY = event.clientY - gesture.startY;
   if (Math.abs(deltaX) + Math.abs(deltaY) > 4) gesture.moved = true;
-
   if (gesture.kind === 'pan') {
     state.viewport.x = gesture.startPanX + deltaX;
     state.viewport.y = gesture.startPanY + deltaY;
@@ -775,26 +1108,18 @@ function pointerMove(event: PointerEvent): void {
     applyViewportTransform();
     return;
   }
-
   if (!gesture.moved) return;
-  invalidateOptimizedRouting();
   const canvasDeltaX = deltaX / state.viewport.scale;
   const canvasDeltaY = deltaY / state.viewport.scale;
   gesture.starts.forEach((start, id) => {
     let x = Math.max(0, start.x + canvasDeltaX);
     let y = Math.max(108, start.y + canvasDeltaY);
-    if (state.snapToGrid) {
-      x = Math.round(x / GRID) * GRID;
-      y = Math.round(y / GRID) * GRID;
-    }
+    if (state.snapToGrid) { x = Math.round(x / GRID) * GRID; y = Math.round(y / GRID) * GRID; }
     state.positions[id] = { x, y };
     const element = nodes.querySelector<HTMLElement>(`[data-id="${CSS.escape(id)}"]`);
-    if (element) {
-      element.style.left = `${x}px`;
-      element.style.top = `${y}px`;
-      element.classList.add('dragging');
-    }
+    if (element) { element.style.left = `${x}px`; element.style.top = `${y}px`; element.classList.add('dragging'); }
   });
+  afterManualPositionChange();
   renderEdges();
 }
 
@@ -802,62 +1127,43 @@ function finishPointer(event: PointerEvent): void {
   const currentGesture = gesture;
   activePointers.delete(event.pointerId);
   try { viewport.releasePointerCapture(event.pointerId); } catch { /* no active capture */ }
-
   if (currentGesture?.kind === 'pinch') {
     viewport.classList.remove('panning');
     save();
     if (activePointers.size === 1) {
       const remaining = [...activePointers.entries()][0];
-      gesture = {
-        kind: 'pan',
-        pointerId: remaining[0],
-        startX: remaining[1].x,
-        startY: remaining[1].y,
-        startPanX: state.viewport.x,
-        startPanY: state.viewport.y,
-        moved: true,
-      };
+      gesture = { kind: 'pan', pointerId: remaining[0], startX: remaining[1].x, startY: remaining[1].y, startPanX: state.viewport.x, startPanY: state.viewport.y, moved: true };
     } else gesture = null;
     return;
   }
-
   if (currentGesture?.kind === 'node' && currentGesture.pointerId === event.pointerId) {
     nodes.querySelectorAll('.dragging').forEach(element => element.classList.remove('dragging'));
-    if (currentGesture.moved) {
-      updateCanvasSize();
-      renderEdges();
-      save();
-    } else {
+    if (currentGesture.moved) { afterManualPositionChange(); updateCanvasSize(); renderEdges(); save(); }
+    else {
       if (currentGesture.additive && currentGesture.wasSelected) selected.delete(currentGesture.nodeId);
       else if (!currentGesture.additive) selected = new Set([currentGesture.nodeId]);
       updateSelection();
     }
   }
-
   if (currentGesture?.kind === 'pan' && currentGesture.pointerId === event.pointerId) {
     viewport.classList.remove('panning');
-    if (!currentGesture.moved && !multiSelect) {
-      selected.clear();
-      updateSelection();
-    } else if (currentGesture.moved) save();
+    if (!currentGesture.moved && !multiSelect) { selected.clear(); updateSelection(); }
+    else if (currentGesture.moved) save();
   }
-
   gesture = null;
 }
 
 function moveSelectedBy(dx: number, dy: number): void {
   if (!selected.size) return;
-  invalidateOptimizedRouting();
-  selected.forEach(id => {
+  const workingSelection = expandedSelectionForCorequisites(selected);
+  workingSelection.forEach(id => {
     const position = state.positions[id];
     if (!position) return;
     position.x = Math.max(0, position.x + dx);
     position.y = Math.max(108, position.y + dy);
-    if (state.snapToGrid) {
-      position.x = Math.round(position.x / GRID) * GRID;
-      position.y = Math.round(position.y / GRID) * GRID;
-    }
+    if (state.snapToGrid) { position.x = Math.round(position.x / GRID) * GRID; position.y = Math.round(position.y / GRID) * GRID; }
   });
+  afterManualPositionChange();
   save();
   renderFlow();
 }
@@ -889,11 +1195,7 @@ function titleLines(title: string): string[] {
   for (const word of words) {
     const next = current ? `${current} ${word}` : word;
     if (next.length <= 30 || !current) current = next;
-    else {
-      lines.push(current);
-      current = word;
-      if (lines.length === 2) break;
-    }
+    else { lines.push(current); current = word; if (lines.length === 2) break; }
   }
   if (lines.length < 2 && current) lines.push(current);
   if (lines.length === 2 && words.join(' ').length > lines.join(' ').length) lines[1] = `${lines[1].slice(0, 27)}…`;
@@ -901,9 +1203,12 @@ function titleLines(title: string): string[] {
 }
 
 function buildExportSvg(): string {
+  if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
   updateCanvasSize();
   const cols = columns();
-  const marker = `<defs><marker id="export-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" fill="#29384f"/></marker></defs>`;
+  const pairs = corequisitePairs();
+  const edges = dependencyEdges(pairs);
+  const marker = `<defs><marker id="export-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" fill="#29384f"/></marker><marker id="export-coreq-arrow" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L7 3.5 L0 7z" fill="#58677d"/></marker></defs>`;
   const background = `<rect width="${logicalWidth}" height="${logicalHeight}" fill="#ffffff"/>`;
   const yearHeaders = years().map(year => {
     const yearColumns = cols.filter(column => column.year === year);
@@ -915,11 +1220,10 @@ function buildExportSvg(): string {
     return `<rect x="${x}" y="18" width="${width}" height="30" rx="7" fill="${palette.base}" stroke="${palette.border}"/><text x="${x + width / 2}" y="38" text-anchor="middle" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="${textColor}">${esc(year.toUpperCase())}</text>`;
   }).join('');
   const termHeaders = cols.map(column => `<rect x="${column.x}" y="62" width="${W}" height="30" rx="7" fill="${svgTermFill(column.year, column.term)}" stroke="${svgPalette(column.year).border}"/><text x="${column.x + W / 2}" y="82" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#344054">${esc(column.term)}</text>`).join('');
-  const edgeMarkup = relationships().map(relationship => {
-    const dash = relationship.type === 'elective' ? ' stroke-dasharray="7 5"' : '';
-    const stroke = relationship.type === 'corequisite' ? '#697386' : '#29384f';
-    const markerEnd = relationship.type === 'corequisite' ? '' : ' marker-end="url(#export-arrow)"';
-    return `<path d="${edgePath(relationship)}" fill="none" stroke="${stroke}" stroke-width="1.5"${dash}${markerEnd}/>`;
+  const coreqMarkup = pairs.map(pair => corequisiteMarkup(pair, true)).join('');
+  const edgeMarkup = edges.map(edge => {
+    const dash = edge.type === 'elective' ? ' stroke-dasharray="7 5"' : '';
+    return `<path d="${edgePath(edge, edges, pairs, cols)}" fill="none" stroke="#29384f" stroke-width="1.5"${dash} marker-end="url(#export-arrow)"/>`;
   }).join('');
   const nodeMarkup = state.courses.map(course => {
     const position = state.positions[course.id];
@@ -929,7 +1233,7 @@ function buildExportSvg(): string {
     const title = lines.map((line, index) => `<text x="${position.x + 9}" y="${position.y + 38 + index * 12}" font-family="Arial,sans-serif" font-size="10.5" fill="#172033">${esc(line)}</text>`).join('');
     return `<g><rect x="${position.x}" y="${position.y}" width="${W}" height="${H}" rx="8" fill="${fill}" stroke="${palette.border}" stroke-width="1.5"/><text x="${position.x + 9}" y="${position.y + 19}" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="#172033">${esc(course.courseNo || 'Untitled')}</text>${title}<text x="${position.x + 9}" y="${position.y + 69}" font-family="Arial,sans-serif" font-size="9.5" font-weight="600" fill="#344054">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}</text></g>`;
   }).join('');
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${logicalWidth}" height="${logicalHeight}" viewBox="0 0 ${logicalWidth} ${logicalHeight}">${marker}${background}${yearHeaders}${termHeaders}${edgeMarkup}${nodeMarkup}</svg>`;
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${logicalWidth}" height="${logicalHeight}" viewBox="0 0 ${logicalWidth} ${logicalHeight}">${marker}${background}${yearHeaders}${termHeaders}${coreqMarkup}${edgeMarkup}${nodeMarkup}</svg>`;
 }
 
 async function downloadImage(): Promise<void> {
@@ -941,10 +1245,7 @@ async function downloadImage(): Promise<void> {
     const svgBlob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
     const svgUrl = URL.createObjectURL(svgBlob);
     const image = new Image();
-    const loaded = new Promise<void>((resolve, reject) => {
-      image.onload = () => resolve();
-      image.onerror = () => reject(new Error('Could not render the flowchart image.'));
-    });
+    const loaded = new Promise<void>((resolve, reject) => { image.onload = () => resolve(); image.onerror = () => reject(new Error('Could not render the flowchart image.')); });
     image.src = svgUrl;
     await loaded;
     const renderScale = Math.max(0.25, Math.min(2, 12000 / logicalWidth, 12000 / logicalHeight));
@@ -980,28 +1281,21 @@ tbody.addEventListener('focusin', event => {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-f]');
   if (input) input.dataset.old = input.value;
 });
-
 tbody.addEventListener('input', event => {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-f]');
   const row = input?.closest<HTMLTableRowElement>('tr[data-id]');
   if (input && row) updateField(row.dataset.id!, input.dataset.f as keyof CurriculumCourse, input.value);
 });
-
 tbody.addEventListener('change', event => {
   const input = (event.target as HTMLElement).closest<HTMLInputElement>('input[data-f]');
   const row = input?.closest<HTMLTableRowElement>('tr[data-id]');
-  if (input && row && input.dataset.f === 'courseNo') {
-    updateField(row.dataset.id!, 'courseNo', input.value, input.dataset.old);
-    renderTable();
-  }
+  if (input && row && input.dataset.f === 'courseNo') { updateField(row.dataset.id!, 'courseNo', input.value, input.dataset.old); renderTable(); }
 });
-
 tbody.addEventListener('click', event => {
   const button = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-act]');
   const row = button?.closest<HTMLTableRowElement>('tr[data-id]');
   if (!button || !row) return;
-  if (button.dataset.act === 'locate') locate(row.dataset.id!);
-  else deleteCourse(row.dataset.id!);
+  if (button.dataset.act === 'locate') locate(row.dataset.id!); else deleteCourse(row.dataset.id!);
 });
 
 viewport.addEventListener('pointerdown', pointerDown);
@@ -1010,15 +1304,10 @@ viewport.addEventListener('pointerup', finishPointer);
 viewport.addEventListener('pointercancel', finishPointer);
 viewport.addEventListener('wheel', event => {
   event.preventDefault();
-  if (event.ctrlKey || event.metaKey) {
-    const factor = Math.exp(-event.deltaY * 0.002);
-    setZoomAt(state.viewport.scale * factor, event.clientX, event.clientY);
-  } else {
+  if (event.ctrlKey || event.metaKey) setZoomAt(state.viewport.scale * Math.exp(-event.deltaY * 0.002), event.clientX, event.clientY);
+  else {
     if (event.shiftKey) state.viewport.x -= event.deltaY;
-    else {
-      state.viewport.x -= event.deltaX;
-      state.viewport.y -= event.deltaY;
-    }
+    else { state.viewport.x -= event.deltaX; state.viewport.y -= event.deltaY; }
     applyViewportTransform();
     save();
   }
@@ -1026,23 +1315,9 @@ viewport.addEventListener('wheel', event => {
 
 viewport.addEventListener('keydown', event => {
   const focusedNode = (event.target as HTMLElement).closest<HTMLElement>('.course-node');
-  if ((event.key === 'Enter' || event.key === ' ') && focusedNode) {
-    event.preventDefault();
-    selected = new Set([focusedNode.dataset.id!]);
-    updateSelection();
-    return;
-  }
-  if (event.key === 'Escape') {
-    selected.clear();
-    updateSelection();
-    return;
-  }
-  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') {
-    event.preventDefault();
-    selected = new Set(state.courses.map(course => course.id));
-    updateSelection();
-    return;
-  }
+  if ((event.key === 'Enter' || event.key === ' ') && focusedNode) { event.preventDefault(); selected = new Set([focusedNode.dataset.id!]); updateSelection(); return; }
+  if (event.key === 'Escape') { selected.clear(); updateSelection(); return; }
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') { event.preventDefault(); selected = new Set(state.courses.map(course => course.id)); updateSelection(); return; }
   const step = event.shiftKey ? 20 : (state.snapToGrid ? GRID : 1);
   if (event.key === 'ArrowLeft') { event.preventDefault(); moveSelectedBy(-step, 0); }
   if (event.key === 'ArrowRight') { event.preventDefault(); moveSelectedBy(step, 0); }
@@ -1055,14 +1330,8 @@ document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => b
 q<HTMLButtonElement>('#add-course').addEventListener('click', addCourse);
 q<HTMLButtonElement>('#reset-sample').addEventListener('click', () => {
   if (!confirm('Replace the current curriculum and layout with the Google Sheets sample?')) return;
-  invalidateOptimizedRouting();
-  state = {
-    courses: createSampleCourses(),
-    positions: {},
-    snapToGrid: true,
-    viewport: { ...DEFAULT_VIEWPORT },
-    updatedAt: Date.now(),
-  };
+  state = { courses: createSampleCourses(), positions: {}, snapToGrid: true, viewport: { ...DEFAULT_VIEWPORT }, layoutMode: 'basic', updatedAt: Date.now() };
+  routePlans = null;
   selected.clear();
   setMultiSelect(false);
   snap.checked = true;
@@ -1071,11 +1340,7 @@ q<HTMLButtonElement>('#reset-sample').addEventListener('click', () => {
   renderTable();
   renderFlow();
 });
-q<HTMLButtonElement>('#generate-flowchart').addEventListener('click', () => {
-  autoLayout();
-  switchView('flow');
-  requestAnimationFrame(() => requestAnimationFrame(fitView));
-});
+q<HTMLButtonElement>('#generate-flowchart').addEventListener('click', () => { autoLayout(); switchView('flow'); requestAnimationFrame(() => requestAnimationFrame(fitView)); });
 q<HTMLButtonElement>('#auto-layout').addEventListener('click', autoLayout);
 q<HTMLButtonElement>('#optimize-layout').addEventListener('click', optimizeLayout);
 q<HTMLButtonElement>('#align-to-terms').addEventListener('click', alignToTerms);
@@ -1092,6 +1357,7 @@ snap.addEventListener('change', () => { state.snapToGrid = snap.checked; save();
 window.addEventListener('resize', () => applyViewportTransform());
 
 ensurePositions();
+if (state.layoutMode === 'optimized') rebuildOptimizedRoutes();
 renderTable();
 renderFlow();
 switchView('table');
