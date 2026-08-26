@@ -2,8 +2,16 @@ import { createSampleCourses } from './sampleData.js';
 import type { AlignmentAction, CanvasViewportState, CurriculumCourse, NodePosition, PersistedState, Relationship } from './types.js';
 
 const KEY = 'curriculum-flowchart:v1';
-const W = 184, H = 78, COL = 260, TOP = 132, GAP = 20, GRID = 10;
-const MIN_SCALE = 0.15, MAX_SCALE = 2.5;
+const W = 184;
+const H = 78;
+const COL = 260;
+const TOP = 132;
+const GAP = 20;
+const GRID = 10;
+const MIN_SCALE = 0.15;
+const MAX_SCALE = 2.5;
+const OPT_BASE_GAP = 30;
+const OPT_TRACK_SPACING = 8;
 const YEARS = ['First Year', 'Second Year', 'Third Year', 'Fourth Year'];
 const TERMS = ['First Semester', 'Second Semester', 'Short Term'];
 const DEFAULT_VIEWPORT: CanvasViewportState = { scale: 1, x: 24, y: 24 };
@@ -11,6 +19,7 @@ const DEFAULT_VIEWPORT: CanvasViewportState = { scale: 1, x: 24, y: 24 };
 type RuntimeState = PersistedState & { viewport: CanvasViewportState };
 interface Column { year: string; term: string; x: number; }
 interface PointerPoint { x: number; y: number; }
+interface OptimizedRoute { d: string; }
 type Gesture =
   | { kind: 'node'; pointerId: number; nodeId: string; startX: number; startY: number; starts: Map<string, NodePosition>; additive: boolean; wasSelected: boolean; moved: boolean }
   | { kind: 'pan'; pointerId: number; startX: number; startY: number; startPanX: number; startPanY: number; moved: boolean }
@@ -39,6 +48,7 @@ const flowHint = q<HTMLElement>('#flow-hint');
 const snap = q<HTMLInputElement>('#snap-toggle');
 const multiSelectButton = q<HTMLButtonElement>('#multi-select-toggle');
 const zoomDisplay = q<HTMLOutputElement>('#zoom-display');
+const downloadButton = q<HTMLButtonElement>('#download-image');
 
 let state = load();
 let selected = new Set<string>();
@@ -47,6 +57,7 @@ let multiSelect = false;
 let gesture: Gesture = null;
 let logicalWidth = 920;
 let logicalHeight = 620;
+let optimizedRoutes: Map<string, OptimizedRoute> | null = null;
 const activePointers = new Map<number, PointerPoint>();
 
 function clamp(value: number, min: number, max: number): number {
@@ -125,7 +136,12 @@ function ensurePositions(): void {
   state.courses.forEach(course => { state.positions[course.id] ??= defaultPos(course); });
 }
 
+function invalidateOptimizedRouting(): void {
+  optimizedRoutes = null;
+}
+
 function autoLayout(): void {
+  invalidateOptimizedRouting();
   columns().forEach(column => {
     state.courses.filter(course => course.yearLevel === column.year && course.semester === column.term).forEach((course, index) => {
       state.positions[course.id] = { x: column.x, y: TOP + index * (H + GAP) };
@@ -167,6 +183,7 @@ function renderTable(): void {
 function updateField(id: string, field: keyof CurriculumCourse, value: string, oldCode?: string): void {
   const course = byId(id);
   if (!course) return;
+  invalidateOptimizedRouting();
 
   if (field === 'prerequisites' || field === 'corequisites' || field === 'electivePrerequisites' || field === 'otherRequirements') course[field] = list(value);
   else if (field === 'yearLevel' || field === 'semester' || field === 'courseNo' || field === 'title' || field === 'units') course[field] = value;
@@ -186,6 +203,7 @@ function updateField(id: string, field: keyof CurriculumCourse, value: string, o
 }
 
 function addCourse(): void {
+  invalidateOptimizedRouting();
   const id = `course-${crypto.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`;
   const course: CurriculumCourse = {
     id,
@@ -209,6 +227,7 @@ function addCourse(): void {
 function deleteCourse(id: string): void {
   const course = byId(id);
   if (!course || !confirm(`Delete ${course.courseNo}? Related references will also be removed.`)) return;
+  invalidateOptimizedRouting();
   state.courses = state.courses.filter(item => item.id !== id);
   delete state.positions[id];
   selected.delete(id);
@@ -233,6 +252,246 @@ function termClass(term: string): string {
   if (value.includes('second')) return 'term-second';
   if (value.includes('short') || value.includes('summer')) return 'term-short';
   return 'term-other';
+}
+
+function relationships(): Relationship[] {
+  const result: Relationship[] = [];
+  const seen = new Set<string>();
+  const add = (code: string, toId: string, type: Relationship['type']): void => {
+    const from = byCode(code);
+    if (!from || from.id === toId) return;
+    const key = `${from.id}|${toId}|${type}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push({ fromId: from.id, toId, type });
+    }
+  };
+  state.courses.forEach(course => {
+    course.prerequisites.forEach(code => add(code, course.id, 'prerequisite'));
+    course.corequisites.forEach(code => add(code, course.id, 'corequisite'));
+    course.electivePrerequisites.forEach(code => add(code, course.id, 'elective'));
+  });
+  return result;
+}
+
+function relationshipKey(relationship: Relationship): string {
+  return `${relationship.fromId}|${relationship.toId}|${relationship.type}`;
+}
+
+function barycentricSort(columnLists: string[][], rels: Relationship[], courseColumns: Map<string, number>): void {
+  const neighbors = new Map<string, string[]>();
+  for (const relationship of rels) {
+    const from = neighbors.get(relationship.fromId) ?? [];
+    from.push(relationship.toId);
+    neighbors.set(relationship.fromId, from);
+    const to = neighbors.get(relationship.toId) ?? [];
+    to.push(relationship.fromId);
+    neighbors.set(relationship.toId, to);
+  }
+
+  const rankMap = (): Map<string, number> => {
+    const result = new Map<string, number>();
+    columnLists.forEach(list => list.forEach((id, index) => result.set(id, index)));
+    return result;
+  };
+
+  const sweep = (forward: boolean): void => {
+    const indices = forward
+      ? Array.from({ length: Math.max(0, columnLists.length - 1) }, (_, i) => i + 1)
+      : Array.from({ length: Math.max(0, columnLists.length - 1) }, (_, i) => columnLists.length - 2 - i);
+
+    for (const columnIndex of indices) {
+      const ranks = rankMap();
+      const current = columnLists[columnIndex];
+      const scored = current.map((id, fallback) => {
+        const relevant = (neighbors.get(id) ?? []).filter(neighborId => {
+          const neighborColumn = courseColumns.get(neighborId);
+          return neighborColumn !== undefined && (forward ? neighborColumn < columnIndex : neighborColumn > columnIndex);
+        });
+        const values = relevant.map(neighborId => ranks.get(neighborId)).filter((value): value is number => value !== undefined);
+        const score = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : fallback;
+        return { id, score, fallback };
+      });
+      scored.sort((a, b) => a.score - b.score || a.fallback - b.fallback);
+      columnLists[columnIndex] = scored.map(item => item.id);
+    }
+  };
+
+  for (let pass = 0; pass < 8; pass += 1) {
+    sweep(true);
+    sweep(false);
+  }
+}
+
+function incidentPortOffset(nodeId: string, relationship: Relationship, rels: Relationship[]): number {
+  const incident = rels
+    .filter(item => item.fromId === nodeId || item.toId === nodeId)
+    .sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
+  if (incident.length <= 1) return 0;
+  const index = Math.max(0, incident.findIndex(item => relationshipKey(item) === relationshipKey(relationship)));
+  const available = Math.min(42, H - 24);
+  const step = Math.min(8, available / Math.max(1, incident.length - 1));
+  return (index - (incident.length - 1) / 2) * step;
+}
+
+function optimizeLayout(): void {
+  ensurePositions();
+  const cols = columns();
+  const rels = relationships();
+  const columnLists = cols.map(column => state.courses
+    .filter(course => course.yearLevel === column.year && course.semester === column.term)
+    .sort((a, b) => (state.positions[a.id]?.y ?? 0) - (state.positions[b.id]?.y ?? 0))
+    .map(course => course.id));
+  const courseColumns = new Map<string, number>();
+  columnLists.forEach((ids, columnIndex) => ids.forEach(id => courseColumns.set(id, columnIndex)));
+  barycentricSort(columnLists, rels, courseColumns);
+
+  const rowById = new Map<string, number>();
+  columnLists.forEach(ids => ids.forEach((id, row) => rowById.set(id, row)));
+  const maxRows = Math.max(1, ...columnLists.map(ids => ids.length));
+  const longEdges = rels.filter(relationship => {
+    const fromColumn = courseColumns.get(relationship.fromId);
+    const toColumn = courseColumns.get(relationship.toId);
+    return fromColumn !== undefined && toColumn !== undefined && Math.abs(toColumn - fromColumn) > 1;
+  });
+
+  const channels = Array.from({ length: maxRows }, () => [] as Relationship[]);
+  for (const relationship of longEdges) {
+    const fromRow = rowById.get(relationship.fromId) ?? 0;
+    const toRow = rowById.get(relationship.toId) ?? 0;
+    let channel = toRow > fromRow ? fromRow : toRow < fromRow ? Math.max(0, fromRow - 1) : fromRow;
+    channel = clamp(channel, 0, maxRows - 1);
+    channels[channel].push(relationship);
+  }
+
+  const gapAfter = channels.map(items => OPT_BASE_GAP + items.length * OPT_TRACK_SPACING);
+  const rowY: number[] = [TOP];
+  for (let row = 0; row < maxRows - 1; row += 1) {
+    rowY[row + 1] = rowY[row] + H + gapAfter[row];
+  }
+
+  columnLists.forEach((ids, columnIndex) => ids.forEach((id, row) => {
+    state.positions[id] = { x: cols[columnIndex].x, y: rowY[row] };
+  }));
+
+  const routes = new Map<string, OptimizedRoute>();
+  const adjacentGroups = new Map<string, Relationship[]>();
+  const sameColumnGroups = new Map<number, Relationship[]>();
+
+  for (const relationship of rels) {
+    const fromColumn = courseColumns.get(relationship.fromId);
+    const toColumn = courseColumns.get(relationship.toId);
+    if (fromColumn === undefined || toColumn === undefined) continue;
+    const span = Math.abs(toColumn - fromColumn);
+    if (span === 0) {
+      const group = sameColumnGroups.get(fromColumn) ?? [];
+      group.push(relationship);
+      sameColumnGroups.set(fromColumn, group);
+    } else if (span === 1) {
+      const key = `${Math.min(fromColumn, toColumn)}:${Math.max(fromColumn, toColumn)}`;
+      const group = adjacentGroups.get(key) ?? [];
+      group.push(relationship);
+      adjacentGroups.set(key, group);
+    }
+  }
+
+  for (const [columnIndex, group] of sameColumnGroups) {
+    group.sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
+    group.forEach((relationship, index) => {
+      const from = state.positions[relationship.fromId];
+      const to = state.positions[relationship.toId];
+      if (!from || !to) return;
+      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
+      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
+      const right = cols[columnIndex].x + W + 14 + index * 6;
+      routes.set(relationshipKey(relationship), { d: `M ${from.x + W} ${fromY} H ${right} V ${toY} H ${to.x + W}` });
+    });
+  }
+
+  for (const [key, group] of adjacentGroups) {
+    const [leftIndexText] = key.split(':');
+    const leftIndex = Number(leftIndexText);
+    const gapStart = cols[leftIndex].x + W;
+    const gapEnd = cols[leftIndex + 1].x;
+    group.sort((a, b) => {
+      const ay = (state.positions[a.fromId]?.y ?? 0) + (state.positions[a.toId]?.y ?? 0);
+      const by = (state.positions[b.fromId]?.y ?? 0) + (state.positions[b.toId]?.y ?? 0);
+      return ay - by || relationshipKey(a).localeCompare(relationshipKey(b));
+    });
+    group.forEach((relationship, index) => {
+      const from = state.positions[relationship.fromId];
+      const to = state.positions[relationship.toId];
+      const fromColumn = courseColumns.get(relationship.fromId)!;
+      const toColumn = courseColumns.get(relationship.toId)!;
+      if (!from || !to) return;
+      const laneX = gapStart + 8 + (index + 1) * Math.max(2, (gapEnd - gapStart - 16) / (group.length + 1));
+      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
+      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
+      const forward = toColumn > fromColumn;
+      const startX = forward ? from.x + W : from.x;
+      const endX = forward ? to.x : to.x + W;
+      routes.set(relationshipKey(relationship), { d: `M ${startX} ${fromY} H ${laneX} V ${toY} H ${endX}` });
+    });
+  }
+
+  channels.forEach((group, channel) => {
+    group.sort((a, b) => relationshipKey(a).localeCompare(relationshipKey(b)));
+    group.forEach((relationship, index) => {
+      const from = state.positions[relationship.fromId];
+      const to = state.positions[relationship.toId];
+      const fromColumn = courseColumns.get(relationship.fromId)!;
+      const toColumn = courseColumns.get(relationship.toId)!;
+      if (!from || !to) return;
+      const laneTop = rowY[channel] + H;
+      const laneY = laneTop + OPT_TRACK_SPACING * (index + 1);
+      const forward = toColumn > fromColumn;
+      const sourceNeighbor = clamp(fromColumn + (forward ? 1 : -1), 0, cols.length - 1);
+      const targetNeighbor = clamp(toColumn + (forward ? -1 : 1), 0, cols.length - 1);
+      const sourceGapX = (forward
+        ? cols[fromColumn].x + W + cols[sourceNeighbor].x
+        : cols[sourceNeighbor].x + W + cols[fromColumn].x) / 2;
+      const targetGapX = (forward
+        ? cols[targetNeighbor].x + W + cols[toColumn].x
+        : cols[toColumn].x + W + cols[targetNeighbor].x) / 2;
+      const fromY = from.y + H / 2 + incidentPortOffset(relationship.fromId, relationship, rels);
+      const toY = to.y + H / 2 + incidentPortOffset(relationship.toId, relationship, rels);
+      const startX = forward ? from.x + W : from.x;
+      const endX = forward ? to.x : to.x + W;
+      routes.set(relationshipKey(relationship), { d: `M ${startX} ${fromY} H ${sourceGapX} V ${laneY} H ${targetGapX} V ${toY} H ${endX}` });
+    });
+  });
+
+  optimizedRoutes = routes;
+  selected.clear();
+  save();
+  renderFlow();
+  requestAnimationFrame(() => requestAnimationFrame(fitView));
+  flowHint.textContent = `Optimized ${rels.length} connections. Semester columns stayed fixed; vertical row spacing expanded where routing tracks needed clearance.`;
+}
+
+function genericEdgePath(relationship: Relationship): string {
+  const from = state.positions[relationship.fromId];
+  const to = state.positions[relationship.toId];
+  if (!from || !to) return '';
+  const fromY = from.y + H / 2;
+  const toY = to.y + H / 2;
+
+  if (relationship.type === 'corequisite' && Math.abs(from.x - to.x) < COL / 2) {
+    const lane = Math.max(from.x, to.x) + W + 18;
+    return `M ${from.x + W} ${fromY} H ${lane} V ${toY} H ${to.x + W}`;
+  }
+  if (to.x >= from.x) {
+    const startX = from.x + W;
+    const middle = startX + Math.max(18, (to.x - startX) / 2);
+    return `M ${startX} ${fromY} H ${middle} V ${toY} H ${to.x}`;
+  }
+  const endX = to.x + W;
+  const middle = endX + Math.max(18, (from.x - endX) / 2);
+  return `M ${from.x} ${fromY} H ${middle} V ${toY} H ${endX}`;
+}
+
+function edgePath(relationship: Relationship): string {
+  return optimizedRoutes?.get(relationshipKey(relationship))?.d ?? genericEdgePath(relationship);
 }
 
 function updateCanvasSize(): void {
@@ -270,47 +529,6 @@ function renderFlow(): void {
   applyViewportTransform();
 }
 
-function relationships(): Relationship[] {
-  const result: Relationship[] = [];
-  const seen = new Set<string>();
-  const add = (code: string, toId: string, type: Relationship['type']): void => {
-    const from = byCode(code);
-    if (!from || from.id === toId) return;
-    const key = `${from.id}|${toId}|${type}`;
-    if (!seen.has(key)) {
-      seen.add(key);
-      result.push({ fromId: from.id, toId, type });
-    }
-  };
-  state.courses.forEach(course => {
-    course.prerequisites.forEach(code => add(code, course.id, 'prerequisite'));
-    course.corequisites.forEach(code => add(code, course.id, 'corequisite'));
-    course.electivePrerequisites.forEach(code => add(code, course.id, 'elective'));
-  });
-  return result;
-}
-
-function edgePath(relationship: Relationship): string {
-  const from = state.positions[relationship.fromId];
-  const to = state.positions[relationship.toId];
-  if (!from || !to) return '';
-  const fromY = from.y + H / 2;
-  const toY = to.y + H / 2;
-
-  if (relationship.type === 'corequisite' && Math.abs(from.x - to.x) < COL / 2) {
-    const lane = Math.max(from.x, to.x) + W + 18;
-    return `M ${from.x + W} ${fromY} H ${lane} V ${toY} H ${to.x + W}`;
-  }
-  if (to.x >= from.x) {
-    const startX = from.x + W;
-    const middle = startX + Math.max(18, (to.x - startX) / 2);
-    return `M ${startX} ${fromY} H ${middle} V ${toY} H ${to.x}`;
-  }
-  const endX = to.x + W;
-  const middle = endX + Math.max(18, (from.x - endX) / 2);
-  return `M ${from.x} ${fromY} H ${middle} V ${toY} H ${endX}`;
-}
-
 function renderEdges(): void {
   svg.innerHTML = `<defs><marker id="arrowhead" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" class="arrowhead-shape"></path></marker></defs>` + relationships().map(relationship => `<path d="${edgePath(relationship)}" class="relationship relationship-${relationship.type}"${relationship.type === 'corequisite' ? '' : ' marker-end="url(#arrowhead)"'}></path>`).join('');
 }
@@ -332,6 +550,7 @@ function updateSelection(): void {
 function align(action: AlignmentAction): void {
   const items = [...selected].map(id => ({ id, position: state.positions[id] })).filter(item => item.position) as { id: string; position: NodePosition }[];
   if (items.length < 2) return;
+  invalidateOptimizedRouting();
 
   const left = Math.min(...items.map(item => item.position.x));
   const right = Math.max(...items.map(item => item.position.x + W));
@@ -369,6 +588,7 @@ function align(action: AlignmentAction): void {
 }
 
 function alignToTerms(): void {
+  invalidateOptimizedRouting();
   const cols = columns();
   selected.forEach(id => {
     const course = byId(id);
@@ -557,6 +777,7 @@ function pointerMove(event: PointerEvent): void {
   }
 
   if (!gesture.moved) return;
+  invalidateOptimizedRouting();
   const canvasDeltaX = deltaX / state.viewport.scale;
   const canvasDeltaY = deltaY / state.viewport.scale;
   gesture.starts.forEach((start, id) => {
@@ -626,6 +847,7 @@ function finishPointer(event: PointerEvent): void {
 
 function moveSelectedBy(dx: number, dy: number): void {
   if (!selected.size) return;
+  invalidateOptimizedRouting();
   selected.forEach(id => {
     const position = state.positions[id];
     if (!position) return;
@@ -638,6 +860,120 @@ function moveSelectedBy(dx: number, dy: number): void {
   });
   save();
   renderFlow();
+}
+
+function svgPalette(year: string): { base: string; border: string; first: string; second: string; short: string } {
+  const palettes = [
+    { base: '#e5bd25', border: '#ac870b', first: '#f1d258', second: '#f7e387', short: '#fff1ba' },
+    { base: '#42a958', border: '#297f3b', first: '#70ca80', second: '#a5dfae', short: '#d7f1dc' },
+    { base: '#438ed3', border: '#2e6da8', first: '#78b4e9', second: '#abd0f3', short: '#dceafa' },
+    { base: '#7185c2', border: '#5669a2', first: '#9caada', second: '#bec8e7', short: '#e1e5f4' },
+  ];
+  return palettes[(years().indexOf(year) % palettes.length + palettes.length) % palettes.length];
+}
+
+function svgTermFill(year: string, term: string): string {
+  const palette = svgPalette(year);
+  const type = termClass(term);
+  if (type === 'term-first') return palette.first;
+  if (type === 'term-second') return palette.second;
+  if (type === 'term-short') return palette.short;
+  return '#f1f3f7';
+}
+
+function titleLines(title: string): string[] {
+  const words = title.trim().split(/\s+/).filter(Boolean);
+  if (!words.length) return ['No descriptive title'];
+  const lines: string[] = [];
+  let current = '';
+  for (const word of words) {
+    const next = current ? `${current} ${word}` : word;
+    if (next.length <= 30 || !current) current = next;
+    else {
+      lines.push(current);
+      current = word;
+      if (lines.length === 2) break;
+    }
+  }
+  if (lines.length < 2 && current) lines.push(current);
+  if (lines.length === 2 && words.join(' ').length > lines.join(' ').length) lines[1] = `${lines[1].slice(0, 27)}…`;
+  return lines.slice(0, 2);
+}
+
+function buildExportSvg(): string {
+  updateCanvasSize();
+  const cols = columns();
+  const marker = `<defs><marker id="export-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth"><path d="M0 0 L8 4 L0 8z" fill="#29384f"/></marker></defs>`;
+  const background = `<rect width="${logicalWidth}" height="${logicalHeight}" fill="#ffffff"/>`;
+  const yearHeaders = years().map(year => {
+    const yearColumns = cols.filter(column => column.year === year);
+    if (!yearColumns.length) return '';
+    const x = yearColumns[0].x;
+    const width = yearColumns[yearColumns.length - 1].x - x + W;
+    const palette = svgPalette(year);
+    const textColor = years().indexOf(year) === 0 ? '#172033' : '#ffffff';
+    return `<rect x="${x}" y="18" width="${width}" height="30" rx="7" fill="${palette.base}" stroke="${palette.border}"/><text x="${x + width / 2}" y="38" text-anchor="middle" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="${textColor}">${esc(year.toUpperCase())}</text>`;
+  }).join('');
+  const termHeaders = cols.map(column => `<rect x="${column.x}" y="62" width="${W}" height="30" rx="7" fill="${svgTermFill(column.year, column.term)}" stroke="${svgPalette(column.year).border}"/><text x="${column.x + W / 2}" y="82" text-anchor="middle" font-family="Arial,sans-serif" font-size="11" font-weight="700" fill="#344054">${esc(column.term)}</text>`).join('');
+  const edgeMarkup = relationships().map(relationship => {
+    const dash = relationship.type === 'elective' ? ' stroke-dasharray="7 5"' : '';
+    const stroke = relationship.type === 'corequisite' ? '#697386' : '#29384f';
+    const markerEnd = relationship.type === 'corequisite' ? '' : ' marker-end="url(#export-arrow)"';
+    return `<path d="${edgePath(relationship)}" fill="none" stroke="${stroke}" stroke-width="1.5"${dash}${markerEnd}/>`;
+  }).join('');
+  const nodeMarkup = state.courses.map(course => {
+    const position = state.positions[course.id];
+    const palette = svgPalette(course.yearLevel);
+    const fill = svgTermFill(course.yearLevel, course.semester);
+    const lines = titleLines(course.title);
+    const title = lines.map((line, index) => `<text x="${position.x + 9}" y="${position.y + 38 + index * 12}" font-family="Arial,sans-serif" font-size="10.5" fill="#172033">${esc(line)}</text>`).join('');
+    return `<g><rect x="${position.x}" y="${position.y}" width="${W}" height="${H}" rx="8" fill="${fill}" stroke="${palette.border}" stroke-width="1.5"/><text x="${position.x + 9}" y="${position.y + 19}" font-family="Arial,sans-serif" font-size="12" font-weight="700" fill="#172033">${esc(course.courseNo || 'Untitled')}</text>${title}<text x="${position.x + 9}" y="${position.y + 69}" font-family="Arial,sans-serif" font-size="9.5" font-weight="600" fill="#344054">${esc(course.units || '—')} unit${course.units === '1' ? '' : 's'}</text></g>`;
+  }).join('');
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${logicalWidth}" height="${logicalHeight}" viewBox="0 0 ${logicalWidth} ${logicalHeight}">${marker}${background}${yearHeaders}${termHeaders}${edgeMarkup}${nodeMarkup}</svg>`;
+}
+
+async function downloadImage(): Promise<void> {
+  downloadButton.disabled = true;
+  const previousText = downloadButton.textContent;
+  downloadButton.textContent = 'Preparing…';
+  try {
+    const svgText = buildExportSvg();
+    const svgBlob = new Blob([svgText], { type: 'image/svg+xml;charset=utf-8' });
+    const svgUrl = URL.createObjectURL(svgBlob);
+    const image = new Image();
+    const loaded = new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error('Could not render the flowchart image.'));
+    });
+    image.src = svgUrl;
+    await loaded;
+    const renderScale = Math.max(0.25, Math.min(2, 12000 / logicalWidth, 12000 / logicalHeight));
+    const output = document.createElement('canvas');
+    output.width = Math.max(1, Math.round(logicalWidth * renderScale));
+    output.height = Math.max(1, Math.round(logicalHeight * renderScale));
+    const context = output.getContext('2d');
+    if (!context) throw new Error('Canvas export is unavailable in this browser.');
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, output.width, output.height);
+    context.drawImage(image, 0, 0, output.width, output.height);
+    URL.revokeObjectURL(svgUrl);
+    const pngBlob = await new Promise<Blob>((resolve, reject) => output.toBlob(blob => blob ? resolve(blob) : reject(new Error('PNG export failed.')), 'image/png'));
+    const pngUrl = URL.createObjectURL(pngBlob);
+    const link = document.createElement('a');
+    link.href = pngUrl;
+    link.download = `curriculum-flowchart-${new Date().toISOString().slice(0, 10)}.png`;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(pngUrl), 1000);
+    status.textContent = 'PNG downloaded';
+  } catch (error) {
+    console.error(error);
+    status.textContent = error instanceof Error ? error.message : 'Image export failed';
+  } finally {
+    downloadButton.disabled = false;
+    downloadButton.textContent = previousText;
+  }
 }
 
 tbody.addEventListener('focusin', event => {
@@ -719,6 +1055,7 @@ document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => b
 q<HTMLButtonElement>('#add-course').addEventListener('click', addCourse);
 q<HTMLButtonElement>('#reset-sample').addEventListener('click', () => {
   if (!confirm('Replace the current curriculum and layout with the Google Sheets sample?')) return;
+  invalidateOptimizedRouting();
   state = {
     courses: createSampleCourses(),
     positions: {},
@@ -740,6 +1077,7 @@ q<HTMLButtonElement>('#generate-flowchart').addEventListener('click', () => {
   requestAnimationFrame(() => requestAnimationFrame(fitView));
 });
 q<HTMLButtonElement>('#auto-layout').addEventListener('click', autoLayout);
+q<HTMLButtonElement>('#optimize-layout').addEventListener('click', optimizeLayout);
 q<HTMLButtonElement>('#align-to-terms').addEventListener('click', alignToTerms);
 q<HTMLButtonElement>('#clear-selection').addEventListener('click', () => { selected.clear(); updateSelection(); });
 multiSelectButton.addEventListener('click', () => setMultiSelect(!multiSelect));
@@ -747,6 +1085,7 @@ q<HTMLButtonElement>('#zoom-out').addEventListener('click', () => zoomBy(0.8));
 q<HTMLButtonElement>('#zoom-in').addEventListener('click', () => zoomBy(1.25));
 q<HTMLButtonElement>('#fit-view').addEventListener('click', fitView);
 q<HTMLButtonElement>('#reset-view').addEventListener('click', resetView);
+downloadButton.addEventListener('click', () => { void downloadImage(); });
 search.addEventListener('input', renderTable);
 snap.checked = state.snapToGrid;
 snap.addEventListener('change', () => { state.snapToGrid = snap.checked; save(); });
