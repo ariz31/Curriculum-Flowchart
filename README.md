@@ -10,11 +10,20 @@ The initial dataset is transcribed from the **Curriculum Map Generator** Google 
 - references to courses in the same term become **corequisites**;
 - non-course requirements such as year-standing requirements are preserved under **Other requirements**.
 
-This heuristic is only used to seed the sample. In the table editor, prerequisite, corequisite, elective-prerequisite, and other-requirement fields are independently editable.
+The sample also seeds a **Track** distinction from the explicit specialization codes already present in the curriculum: `S1`–`S5` courses are initialized as **Structural**, `G1`–`G5` courses as **Geotechnical**, and all other courses as **Common**. Track values remain editable, so additional curriculum tracks can be added without changing the code.
+
+This heuristic is only used to seed the sample. In the table editor, prerequisite, corequisite, elective-prerequisite, other-requirement, and track fields are independently editable.
 
 ## Features
 
 - Spreadsheet-style curriculum table editor
+- Dedicated editable **Track** column
+- Built-in Common, Structural, and Geotechnical track distinctions with support for custom track names
+- Track filtering across both the table and flowchart
+- Selecting a specialization filter keeps **Common** curriculum subjects visible with that specialization
+- Independent show/hide switches for each track plus a one-click **Show all** reset
+- Track filter and visibility state persisted locally
+- Current track visibility also applies to connector rendering, Auto Sort, selection, Fit calculations, and PNG export
 - Mobile card-style table editing below tablet widths
 - Add, edit, locate, and delete courses
 - Course-code reference updates when a code is renamed
@@ -48,9 +57,19 @@ This heuristic is only used to seed the sample. In the table editor, prerequisit
 - Zoom range from 15% to 250%
 - Zoom-aware node dragging so movement remains correct at every scale
 - Keyboard arrow movement for selected nodes as a non-drag alternative
-- **Download PNG** export of the complete curriculum map independent of the current zoom/pan viewport
-- Local browser persistence for curriculum data, node positions, zoom, pan state, and optimized/basic layout mode
+- **Download PNG** export of the currently visible curriculum/track map independent of the current zoom/pan viewport
+- Local browser persistence for curriculum data, node positions, zoom, pan state, track view, and optimized/basic layout mode
 - Responsive touch targets and horizontally scrollable tool groups on small screens
+
+## Track behavior
+
+Each course now has a `Track` value in the editable curriculum table. The default sample distinguishes **Common**, **Structural**, and **Geotechnical** courses, while custom values are accepted for future specializations.
+
+The global **Track filter** affects both the table and flowchart. `All tracks` shows every visible track. Selecting **Structural** shows Structural courses together with Common courses; selecting **Geotechnical** shows Geotechnical courses together with Common courses. Selecting **Common only** removes all specialization-only courses.
+
+The **Show / hide** switches work independently of the filter. This makes it possible to hide an individual track while keeping the rest of the curriculum visible, or to hide Common courses for a specialization-only inspection. **Show all** clears both the filter and hidden-track state.
+
+Auto Sort, prerequisite/corequisite connectors, selection, canvas sizing, and PNG export operate on the currently visible track view. Hidden courses and their connectors are not exported.
 
 ## Auto-sort behavior
 
@@ -74,7 +93,7 @@ Auto Sort is now a persistent layout mode. Moving, aligning, or keyboard-nudging
 
 ## Image export
 
-Use **Download PNG** from the flowchart toolbar to export the complete curriculum diagram. The export includes year headers, semester shades, course boxes, prerequisite/elective connectors, double-line corequisite arrows, propagated prerequisite branches, and the optimized routing geometry. Export is generated from curriculum coordinates, so it is not cropped to the currently visible mobile/desktop viewport.
+Use **Download PNG** from the flowchart toolbar to export the current visible curriculum diagram. The export includes year headers, semester shades, visible course boxes, prerequisite/elective connectors, double-line corequisite arrows, propagated prerequisite branches, and optimized routing geometry. Export is generated from curriculum coordinates, so it is not cropped to the currently visible mobile/desktop viewport.
 
 ## Mobile interaction
 
@@ -84,7 +103,7 @@ Use **Download PNG** from the flowchart toolbar to export the complete curriculu
 - **Pinch with two fingers** to zoom and pan around the pinch focal point.
 - Enable **Multi-select** to tap several courses without needing desktop modifier keys.
 - Alignment and distribution tools apply to the current selection.
-- Use **Fit** to frame the complete curriculum, or **100%** to restore the default viewport.
+- Use **Fit** to frame the complete visible curriculum, or **100%** to restore the default viewport.
 
 ## Color system
 
