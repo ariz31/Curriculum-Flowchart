@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Editable curriculum table and prerequisite flowchart maker." />
+    <title>Curriculum Flowchart Maker</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="app-header">
+        <div class="brand">
+          <h1>Curriculum Flowchart Maker</h1>
+          <p>Edit the curriculum table, generate the map, then arrange and align course boxes.</p>
+        </div>
+        <div class="header-actions">
+          <span id="save-status" class="save-status" aria-live="polite">Loading…</span>
+          <button id="reset-sample" class="secondary-button" type="button">Reset sample</button>
+          <button id="generate-flowchart" class="primary-button" type="button">Generate flowchart</button>
+        </div>
+      </header>
+
+      <nav class="tabs" role="tablist" aria-label="Curriculum editor views">
+        <button class="tab-button active" type="button" data-view="table" role="tab" aria-selected="true">Table editor</button>
+        <button class="tab-button" type="button" data-view="flow" role="tab" aria-selected="false">Flowchart</button>
+      </nav>
+
+      <main>
+        <section id="table-panel" class="panel" aria-label="Curriculum table editor">
+          <div class="table-toolbar">
+            <div class="toolbar-group">
+              <button id="add-course" class="secondary-button" type="button">+ Add course</button>
+              <span id="course-count" class="course-count"></span>
+            </div>
+            <input id="course-search" class="search-input" type="search" placeholder="Search course code, title, year, or requirement…" aria-label="Search curriculum courses" />
+          </div>
+
+          <div class="table-wrap">
+            <table class="curriculum-table">
+              <thead>
+                <tr>
+                  <th>Year Level</th>
+                  <th>Semester</th>
+                  <th>Course No.</th>
+                  <th>Course Descriptive Title</th>
+                  <th>Units</th>
+                  <th>Prerequisite(s)</th>
+                  <th>Corequisite(s)</th>
+                  <th>Elective prerequisite(s)</th>
+                  <th>Other requirements</th>
+                  <th>Actions</th>
+                </tr>
+              </thead>
+              <tbody id="curriculum-table-body"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="flow-panel" class="panel" aria-label="Curriculum flowchart" hidden>
+          <div class="flow-toolbar">
+            <div class="toolbar-group">
+              <span class="toolbar-label">Layout</span>
+              <button id="auto-layout" class="toolbar-button" type="button">Auto layout</button>
+              <button id="align-to-terms" class="toolbar-button" type="button">Align to term columns</button>
+              <label class="switch"><input id="snap-toggle" type="checkbox" /> Snap to grid</label>
+            </div>
+
+            <div class="toolbar-group" aria-label="Alignment tools">
+              <span class="toolbar-label">Align</span>
+              <button class="toolbar-button compact" type="button" data-align="left" title="Align left">Left</button>
+              <button class="toolbar-button compact" type="button" data-align="center" title="Align horizontal centers">Center</button>
+              <button class="toolbar-button compact" type="button" data-align="right" title="Align right">Right</button>
+              <button class="toolbar-button compact" type="button" data-align="top" title="Align top">Top</button>
+              <button class="toolbar-button compact" type="button" data-align="middle" title="Align vertical centers">Middle</button>
+              <button class="toolbar-button compact" type="button" data-align="bottom" title="Align bottom">Bottom</button>
+              <button class="toolbar-button compact" type="button" data-align="distribute-horizontal" title="Distribute horizontally">Distribute H</button>
+              <button class="toolbar-button compact" type="button" data-align="distribute-vertical" title="Distribute vertically">Distribute V</button>
+              <button id="clear-selection" class="toolbar-button compact" type="button">Clear</button>
+            </div>
+          </div>
+
+          <div class="flow-help">
+            <div>
+              <span id="selection-status" class="selection-status">No courses selected</span>
+              <span aria-hidden="true"> · </span>
+              <span id="flow-hint">Shift-click to select multiple courses for alignment.</span>
+            </div>
+            <div class="legend" aria-label="Relationship legend">
+              <span class="legend-item"><span class="legend-line arrow"></span>Prerequisite</span>
+              <span class="legend-item"><span class="legend-line dashed arrow"></span>Prerequisite (elective)</span>
+              <span class="legend-item"><span class="legend-line coreq"></span>Corequisite</span>
+            </div>
+          </div>
+
+          <div id="canvas-viewport" class="canvas-viewport" tabindex="0" aria-label="Interactive curriculum canvas. Shift-click courses for multi-select. Arrow keys move selected courses.">
+            <div id="flow-canvas" class="flow-canvas">
+              <svg id="connections-svg" class="connections-svg" aria-hidden="true"></svg>
+              <div id="headers-layer" class="headers-layer"></div>
+              <div id="nodes-layer" class="nodes-layer"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <datalist id="year-options">
+        <option value="First Year"></option>
+        <option value="Second Year"></option>
+        <option value="Third Year"></option>
+        <option value="Fourth Year"></option>
+        <option value="Fifth Year"></option>
+      </datalist>
+      <datalist id="semester-options">
+        <option value="First Semester"></option>
+        <option value="Second Semester"></option>
+        <option value="Short Term"></option>
+        <option value="Summer"></option>
+      </datalist>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
