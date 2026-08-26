@@ -165,7 +165,23 @@ main { flex: 1; min-width: 0; }
   border-bottom: 4px solid transparent;
 }
 .legend-line.dashed { border-top-style: dashed; }
-.legend-line.coreq { border-top-color: #697386; }
+.legend-line.coreq {
+  height: 7px;
+  border-top: 2px solid #58677d;
+  border-bottom: 2px solid #58677d;
+}
+.legend-line.coreq::before,
+.legend-line.coreq::after {
+  content: '';
+  position: absolute;
+  width: 0;
+  height: 0;
+  top: -4px;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+}
+.legend-line.coreq::before { left: -1px; border-right: 6px solid #58677d; }
+.legend-line.coreq::after { right: -1px; top: 1px; border-left: 6px solid #58677d; }
 .semester-shade-key { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 9px; color: #667085; font-size: .75rem; }
 .semester-shade-key span { display: inline-flex; align-items: center; gap: 5px; }
 .shade-swatch { width: 18px; height: 12px; border-radius: 3px; border: 1px solid #8ca2c8; display: inline-block; }
@@ -274,8 +290,15 @@ main { flex: 1; min-width: 0; }
 
 .relationship { fill: none; stroke: #29384f; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .relationship-elective { stroke-dasharray: 7 5; }
-.relationship-corequisite { stroke: #697386; stroke-width: 1.35; }
+.relationship-from-coreq { stroke-width: 1.7; }
 .arrowhead-shape { fill: #29384f; }
+.corequisite-line {
+  fill: none;
+  stroke: #58677d;
+  stroke-width: 1.8;
+  vector-effect: non-scaling-stroke;
+}
+.coreq-arrowhead-shape { fill: #58677d; }
 
 @media (max-width: 760px) {
   .app-header { position: static; display: grid; gap: 10px; padding: 14px; }
