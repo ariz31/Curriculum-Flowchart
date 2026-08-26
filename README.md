@@ -19,12 +19,18 @@ This heuristic is only used to seed the sample. In the table editor, prerequisit
 - Add, edit, locate, and delete courses
 - Course-code reference updates when a code is renamed
 - Automatic year/semester flowchart generation
-- **Auto sort** that reorders courses within semester columns to reduce connector crossings
+- **Auto sort** with repeated topology-aware ordering and chain alignment
 - Fixed horizontal semester-column spacing during optimization
-- Dynamic **vertical** spacing between course rows to create dedicated routing tracks
-- Separate connector lanes for adjacent-semester relationships
-- Dedicated horizontal routing tracks for long prerequisite links so they can pass between course rows rather than through course boxes
-- Individually draggable course boxes after optimization
+- Non-uniform **vertical** spacing that expands only where routing clearance is needed
+- Straight horizontal prerequisite chains whenever geometry permits
+- Separate vertical lanes for adjacent-semester relationships
+- Dedicated horizontal corridors for long prerequisite links
+- Corequisite pairs treated as compound layout units
+- Corequisites rendered as a vertical **double-line two-way arrow** from the upper course bottom-center to the lower course top-center
+- If both members of a corequisite pair are prerequisites of a later course, the redundant pair of prerequisite lines is collapsed into one prerequisite branch from the shared corequisite connector
+- Corequisite partners move together so the vertical corequisite geometry is preserved during manual editing
+- Optimized routing remains active and is recomputed after manual node movement instead of falling back to generic arrows
+- Individually draggable course boxes
 - One base color family per year level
 - Distinct shades within each year for First Semester, Second Semester, and Short Term
 - Shift/Ctrl/Cmd multi-selection on desktop
@@ -34,7 +40,7 @@ This heuristic is only used to seed the sample. In the table editor, prerequisit
 - Align selected nodes back to their term columns
 - Optional 10 px snap-to-grid
 - Orthogonal prerequisite routing
-- Distinct prerequisite, elective-prerequisite, and corequisite line styles
+- Distinct prerequisite and elective-prerequisite line styles
 - One-finger canvas panning on empty space
 - Two-finger pinch-to-zoom around the gesture focal point
 - Trackpad pinch / Ctrl-wheel zoom and wheel/trackpad panning
@@ -43,22 +49,32 @@ This heuristic is only used to seed the sample. In the table editor, prerequisit
 - Zoom-aware node dragging so movement remains correct at every scale
 - Keyboard arrow movement for selected nodes as a non-drag alternative
 - **Download PNG** export of the complete curriculum map independent of the current zoom/pan viewport
-- Local browser persistence for curriculum data, node positions, zoom, and pan state
+- Local browser persistence for curriculum data, node positions, zoom, pan state, and optimized/basic layout mode
 - Responsive touch targets and horizontally scrollable tool groups on small screens
 
 ## Auto-sort behavior
 
-The optimizer keeps the semester columns at their normal horizontal locations. It then uses repeated barycentric sweeps to reorder courses vertically according to their prerequisite relationships. This reduces graph crossings without changing the curriculum's year/semester structure.
+The optimizer keeps semester columns at their normal horizontal positions. Corequisite-connected courses are first grouped into compound units so no unrelated course is inserted between the members of a corequisite pair.
 
-For relationships that span multiple semester columns, the optimizer assigns horizontal routing tracks in the empty space **between course rows**. The vertical gap after a row grows according to the number of tracks that need that corridor. This is intentional: readability and line traceability take priority over minimizing the total height of the diagram.
+The layout then performs repeated barycentric ordering passes to reduce crossings, followed by weighted center alignment. Direct prerequisite chains receive stronger alignment weight, so courses such as `A -> B -> C` are placed on the same horizontal path whenever there is enough room to do so.
 
-Adjacent-semester connections use separate vertical lanes in the normal space between the two semester columns. Course connection ports are also offset when a course has several incident links so that multiple lines do not begin on exactly the same segment.
+Vertical spacing is not a global row multiplier. After alignment, the optimizer measures routing demand between vertical levels and expands only the boundaries that need additional tracks. Unused boundaries remain compact. Long relationships search for clear horizontal corridors that do not intersect unrelated course boxes, while adjacent-semester edges receive separate vertical lanes.
 
-The optimizer strongly reduces avoidable line overlaps and node intersections, but arbitrary curriculum graphs can still contain topological crossings that cannot be eliminated without changing the graph itself. Manual dragging and alignment remain available after optimization.
+The optimizer strongly reduces avoidable line overlaps and node intersections. Arbitrary curriculum graphs can still contain topological crossings that cannot be eliminated without changing the graph itself, but the solver prefers straight, non-overlapping, individually traceable paths before compactness.
+
+### Corequisite propagation
+
+A same-term corequisite pair is rendered vertically using two parallel lines with opposite arrow directions. The connector is attached only to the bottom-center of the upper course and the top-center of the lower course.
+
+When a later course lists **both** members of that pair as prerequisites, the two redundant prerequisite edges are collapsed into a single outgoing prerequisite branch from the shared corequisite line. Multiple downstream courses receive distinct branch points along that connector when space allows.
+
+### Moving nodes after Auto Sort
+
+Auto Sort is now a persistent layout mode. Moving, aligning, or keyboard-nudging an optimized node recomputes the optimized routing plan against the new coordinates instead of invalidating the plan and reverting to generic midpoint arrows. Corequisite partners are moved as a group so their required vertical connection remains valid.
 
 ## Image export
 
-Use **Download PNG** from the flowchart toolbar to export the complete curriculum diagram. The export includes year headers, semester shades, course boxes, prerequisite/elective/corequisite connectors, and the optimized routing geometry. Export is generated from curriculum coordinates, so it is not cropped to the currently visible mobile/desktop viewport.
+Use **Download PNG** from the flowchart toolbar to export the complete curriculum diagram. The export includes year headers, semester shades, course boxes, prerequisite/elective connectors, double-line corequisite arrows, propagated prerequisite branches, and the optimized routing geometry. Export is generated from curriculum coordinates, so it is not cropped to the currently visible mobile/desktop viewport.
 
 ## Mobile interaction
 
