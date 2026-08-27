@@ -87,21 +87,48 @@
       });
   }
 
-  function sourcePortY(edge, edges, pairs, cols) {
+  function sourcePortPlan(edge, edges, pairs, cols) {
     const position = state.positions[edge.fromId];
     if (!position) return null;
     const siblings = outgoingSiblings(edge, edges, pairs, cols);
-    if (siblings.length <= 1) return position.y + H / 2;
+    if (!siblings.length) return null;
     const index = Math.max(0, siblings.findIndex(item => item.key === edge.key));
-    const requested = horizontalSpacing();
-    const usable = Math.max(0, H - SOURCE_FACE_MARGIN * 2);
-    const step = Math.min(requested, usable / Math.max(1, siblings.length - 1));
-    return position.y + H / 2 + (index - (siblings.length - 1) / 2) * step;
+    const centerY = position.y + H / 2;
+    if (siblings.length === 1) return { y: centerY, siblings, index };
+
+    const minY = position.y + SOURCE_FACE_MARGIN;
+    const maxY = position.y + H - SOURCE_FACE_MARGIN;
+    const usable = Math.max(0, maxY - minY);
+    const step = Math.min(horizontalSpacing(), usable / Math.max(1, siblings.length - 1));
+    const span = step * (siblings.length - 1);
+    const targets = siblings.map(item => targetCenterY(item, pairs));
+    const minTarget = Math.min(...targets);
+    const maxTarget = Math.max(...targets);
+    const meanTarget = targets.reduce((sum, value) => sum + value, 0) / targets.length;
+    let desiredCenter = centerY;
+
+    // Bias the source-face fanout toward where the destinations actually are. This keeps
+    // all-upward families on the upper face and all-downward families on the lower face,
+    // while mixed families remain centered but can lean toward their target centroid.
+    if (maxTarget < centerY - EPS) desiredCenter = minY + span / 2;
+    else if (minTarget > centerY + EPS) desiredCenter = maxY - span / 2;
+    else {
+      const slack = Math.max(0, usable - span) / 2;
+      const normalizedDelta = clamp((meanTarget - centerY) / Math.max(H * 2, 1), -1, 1);
+      desiredCenter = centerY + normalizedDelta * slack;
+    }
+
+    const start = clamp(desiredCenter - span / 2, minY, Math.max(minY, maxY - span));
+    return { y: start + index * step, siblings, index };
+  }
+
+  function sourcePortY(edge, edges, pairs, cols) {
+    return sourcePortPlan(edge, edges, pairs, cols)?.y ?? null;
   }
 
   // Standardized source rule: every outgoing prerequisite/elective relationship from
-  // a course owns a distinct source-face attachment point. Pair sources remain the
-  // intentional compound-corequisite exception handled by pairBranchAnchor.
+  // a course owns a distinct source-face attachment point, ordered by target Y. Pair
+  // sources remain the intentional compound-corequisite exception handled elsewhere.
   const baseSourceAnchorForIndependentRoutes = sourceAnchor;
   sourceAnchor = (edge, edges, pairs, cols) => {
     if (edge.sourceKind !== 'course') return baseSourceAnchorForIndependentRoutes(edge, edges, pairs, cols);
@@ -116,22 +143,35 @@
     };
   };
 
+  function laneRank(edge, siblings, pairs) {
+    const sourcePosition = state.positions[edge.fromId];
+    if (!sourcePosition) return Math.max(0, siblings.findIndex(item => item.key === edge.key));
+    const sourceCenter = sourcePosition.y + H / 2;
+    const nestingOrder = [...siblings].sort((a, b) => {
+      // Farthest vertical destinations receive the nearest propagation lanes. This
+      // produces nested orthogonal routes with fewer near-source crossings.
+      const distanceDelta = Math.abs(targetCenterY(b, pairs) - sourceCenter) - Math.abs(targetCenterY(a, pairs) - sourceCenter);
+      if (Math.abs(distanceDelta) > 0.01) return distanceDelta;
+      const targetDelta = targetCenterY(a, pairs) - targetCenterY(b, pairs);
+      return Math.abs(targetDelta) > 0.01 ? targetDelta : a.key.localeCompare(b.key);
+    });
+    return Math.max(0, nestingOrder.findIndex(item => item.key === edge.key));
+  }
+
   function dedicatedFirstLane(edge, edges, pairs, cols, points) {
     if (edge.sourceKind !== 'course' || points.length < 2) return points;
     if (window.CurriculumManualRouting?.hasManualRoute?.(edge.key)) return points;
 
     const siblings = outgoingSiblings(edge, edges, pairs, cols);
     if (siblings.length <= 1) return points;
-    const index = siblings.findIndex(item => item.key === edge.key);
-    if (index < 0) return points;
-
+    const rank = laneRank(edge, siblings, pairs);
     const source = points[0];
     const direction = edgeDirection(edge, pairs, cols) || 1;
-    const laneX = source.x + direction * (SOURCE_LANE_STUB + index * verticalSpacing());
+    const laneX = source.x + direction * (SOURCE_LANE_STUB + rank * verticalSpacing());
 
-    // Replace only the near-source geometry. The remainder of the router's path stays
-    // intact, but each dependency gets its own horizontal source stub and its own first
-    // vertical lane, so no shared trunk can be formed visually.
+    // Replace only the near-source geometry. Each dependency gets a distinct source
+    // stub and first vertical lane, while the target-aware nesting rank minimizes local
+    // crossing before the obstacle router takes over.
     const next = clone(points);
     let firstVerticalIndex = -1;
     for (let i = 0; i < next.length - 1; i += 1) {
@@ -146,10 +186,7 @@
       next[1].y = source.y;
       next[firstVerticalIndex].x = laneX;
       next[firstVerticalIndex + 1].x = laneX;
-      if (firstVerticalIndex > 1) {
-        // Collapse any pre-existing shared source jog into the dedicated lane.
-        next.splice(2, firstVerticalIndex - 1);
-      }
+      if (firstVerticalIndex > 1) next.splice(2, firstVerticalIndex - 1);
     } else {
       const target = next.at(-1);
       if (!target) return points;
@@ -172,9 +209,6 @@
     return serializeOrthogonal(separated) || base;
   };
 
-  // Rebuild on both spacing controls. Because sourceAnchor/edgePath are used on every
-  // render, the same independent-line rule also persists after node movement, sorting,
-  // layout changes, JSON restore, and normal rerenders.
   document.addEventListener('change', event => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
@@ -182,6 +216,13 @@
     renderEdges();
     window.CurriculumConnectorGeometry?.request?.();
   }, true);
+
+  window.CurriculumIndependentPrerequisiteRoutes = {
+    refresh: () => {
+      renderEdges();
+      window.CurriculumConnectorGeometry?.request?.();
+    },
+  };
 
   renderEdges();
   window.CurriculumConnectorGeometry?.request?.();
