@@ -1,0 +1,81 @@
+name: Sync balanced routing with main
+
+on:
+  push:
+    branches:
+      - feat/balanced-routing
+    paths:
+      - .github/workflows/sync-main-balanced-routing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out balanced routing branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/balanced-routing
+          fetch-depth: 0
+
+      - name: Merge latest main and preserve balanced routing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git merge --no-commit -X ours origin/main
+
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          path = Path('src/main.ts')
+          ours = path.read_text()
+          main = subprocess.check_output(['git', 'show', 'origin/main:src/main.ts'], text=True)
+
+          signature = 'function barycentricSortUnits('
+
+          def extract_function(text: str, signature: str) -> tuple[int, int, str]:
+              start = text.index(signature)
+              brace = text.index('{', start)
+              depth = 0
+              end = None
+              for index in range(brace, len(text)):
+                  char = text[index]
+                  if char == '{':
+                      depth += 1
+                  elif char == '}':
+                      depth -= 1
+                      if depth == 0:
+                          end = index + 1
+                          break
+              if end is None:
+                  raise RuntimeError(f'Could not parse {signature}')
+              return start, end, text[start:end]
+
+          ours_start, ours_end, _ = extract_function(ours, signature)
+          _, _, main_function = extract_function(main, signature)
+          merged = ours[:ours_start] + main_function + ours[ours_end:]
+          path.write_text(merged)
+          PY
+
+      - name: Validate merged implementation
+        run: |
+          npm install --package-lock=false
+          npm run typecheck
+          npm run build
+
+      - name: Commit synchronized branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm .github/workflows/sync-main-balanced-routing.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git add -A
+          git commit -m "chore: sync balanced routing with latest main"
+          git push origin HEAD:feat/balanced-routing
