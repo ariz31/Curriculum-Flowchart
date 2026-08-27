@@ -4,11 +4,51 @@
   const BASE_NODE_HEIGHT = 78;
   const COMPACT_NODE_HEIGHT = 62;
   const NODE_CLEARANCE = 10;
-  const LANE_SPACING = 7;
+  const DEFAULT_LANE_SPACING = 7;
+  const MIN_LANE_SPACING = 3;
+  const MAX_LANE_SPACING = 30;
   const EPSILON = 0.75;
+  const CURRICULUM_LIBRARY_KEY = 'curriculum-flowchart:curricula:v1';
+  const LANE_SPACING_KEY = 'curriculum-flowchart:vertical-lane-spacing:v1';
 
   const number = value => Number.parseFloat(value || '0');
   const formatNumber = value => Number(value.toFixed(3)).toString();
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
+  const safeParse = value => {
+    try { return value ? JSON.parse(value) : null; }
+    catch { return null; }
+  };
+
+  const activeCurriculumId = () => String(
+    safeParse(localStorage.getItem(CURRICULUM_LIBRARY_KEY))?.activeId || 'default',
+  );
+
+  const spacingMap = () => {
+    const stored = safeParse(localStorage.getItem(LANE_SPACING_KEY));
+    return stored && typeof stored === 'object' ? stored : {};
+  };
+
+  const laneSpacing = () => {
+    const value = Number(spacingMap()[activeCurriculumId()]);
+    return Number.isFinite(value)
+      ? clamp(value, MIN_LANE_SPACING, MAX_LANE_SPACING)
+      : DEFAULT_LANE_SPACING;
+  };
+
+  let spacingInput = null;
+
+  const syncSpacingInput = () => {
+    if (spacingInput instanceof HTMLInputElement) spacingInput.value = String(laneSpacing());
+  };
+
+  const setLaneSpacing = value => {
+    const next = clamp(Number(value) || DEFAULT_LANE_SPACING, MIN_LANE_SPACING, MAX_LANE_SPACING);
+    const map = spacingMap();
+    map[activeCurriculumId()] = next;
+    localStorage.setItem(LANE_SPACING_KEY, JSON.stringify(map));
+    syncSpacingInput();
+    return next;
+  };
 
   const parseOrthogonalPath = d => {
     const commands = [...String(d || '').matchAll(/([MHV])\s*(-?[\d.]+)(?:\s+(-?[\d.]+))?/g)];
@@ -71,9 +111,10 @@
   };
 
   const candidateLaneXs = baseX => {
+    const spacing = laneSpacing();
     const values = [baseX];
     for (let step = 1; step <= 28; step += 1) {
-      values.push(baseX + step * LANE_SPACING, baseX - step * LANE_SPACING);
+      values.push(baseX + step * spacing, baseX - step * spacing);
     }
     return values;
   };
@@ -97,6 +138,7 @@
   }
 
   function separateVerticalSegments(paths, boxes) {
+    const spacing = laneSpacing();
     const records = paths.map((path, pathOrder) => ({
       path,
       pathOrder,
@@ -148,7 +190,7 @@
             if (segment.segmentIndex + 2 < points.length && horizontalBlocked(end.y, candidateX, next.x, boxes, endIgnored)) return false;
             return !assigned.some(other =>
               intervalsOverlap(segment, other.segment) &&
-              Math.abs(candidateX - other.x) < LANE_SPACING - 0.5
+              Math.abs(candidateX - other.x) < spacing - 0.5
             );
           });
 
@@ -201,6 +243,48 @@
     }));
   };
 
+  const installSpacingControl = () => {
+    if (document.querySelector('#vertical-lane-spacing')) return;
+    const snapToggle = document.querySelector('#snap-toggle');
+    const anchor = snapToggle?.closest('label');
+    if (!(anchor instanceof HTMLElement)) return;
+
+    const control = document.createElement('label');
+    control.className = 'vertical-lane-spacing-control';
+    control.title = 'Set the minimum horizontal spacing between automatically separated overlapping vertical relationship lines.';
+    control.innerHTML = `
+      <span>Line gap</span>
+      <input id="vertical-lane-spacing" type="number" min="${MIN_LANE_SPACING}" max="${MAX_LANE_SPACING}" step="1" inputmode="numeric" aria-label="Spacing between parallel vertical relationship lines in pixels" />
+      <span>px</span>`;
+    anchor.insertAdjacentElement('beforebegin', control);
+    spacingInput = control.querySelector('#vertical-lane-spacing');
+    syncSpacingInput();
+
+    const apply = () => {
+      if (!(spacingInput instanceof HTMLInputElement)) return;
+      const next = setLaneSpacing(spacingInput.value);
+      const runtime = window.CurriculumFlowchartRuntime;
+      if (runtime?.renderFlow) runtime.renderFlow();
+      else scheduleLiveSeparation();
+      runtime?.setHint?.(`Parallel vertical relationship-line spacing set to ${next} px.`);
+    };
+
+    spacingInput?.addEventListener('change', apply);
+    spacingInput?.addEventListener('keydown', event => {
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      spacingInput.blur();
+    });
+
+    const style = document.createElement('style');
+    style.textContent = `
+      .vertical-lane-spacing-control{display:inline-flex;align-items:center;gap:4px;color:#44516a;font-size:.76rem;font-weight:650;white-space:nowrap}
+      #vertical-lane-spacing{width:54px;min-height:34px;border:1px solid #d8deea;border-radius:7px;padding:4px 6px;background:#fff;color:#172033;font:inherit}
+      @media(max-width:760px){#vertical-lane-spacing{width:60px;min-height:42px}.vertical-lane-spacing-control{font-size:.72rem}}
+    `;
+    document.head.append(style);
+  };
+
   const connectionsSvg = document.querySelector('#connections-svg');
   const nodesLayer = document.querySelector('#nodes-layer');
   if (connectionsSvg) new MutationObserver(scheduleLiveSeparation).observe(connectionsSvg, { childList: true, subtree: true });
@@ -247,5 +331,18 @@
     }
   }
 
+  window.CurriculumVerticalLaneSpacing = {
+    get: laneSpacing,
+    set: value => {
+      const next = setLaneSpacing(value);
+      window.CurriculumFlowchartRuntime?.renderFlow?.();
+      return next;
+    },
+    min: MIN_LANE_SPACING,
+    max: MAX_LANE_SPACING,
+    defaultValue: DEFAULT_LANE_SPACING,
+  };
+
+  installSpacingControl();
   window.Blob = ParallelLaneBlob;
 })();
