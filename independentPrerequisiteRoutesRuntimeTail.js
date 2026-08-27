@@ -52,9 +52,9 @@
     return targetColumn >= sourceColumn ? 1 : -1;
   }
 
-  function targetCenterY(edge) {
+  function targetCenterY(edge, pairs) {
     if (edge.targetKind === 'pair' && edge.targetPairKey) {
-      const pair = pairByKey(edge.targetPairKey, corequisitePairs());
+      const pair = pairByKey(edge.targetPairKey, pairs);
       const geometry = pair ? pairGeometry(pair) : null;
       return geometry?.junctionY ?? 0;
     }
@@ -68,18 +68,9 @@
     return edges
       .filter(item => item.sourceKind === 'course' && item.fromId === edge.fromId && edgeDirection(item, pairs, cols) === direction)
       .sort((a, b) => {
-        const delta = targetCenterY(a) - targetCenterY(b);
+        const delta = targetCenterY(a, pairs) - targetCenterY(b, pairs);
         return Math.abs(delta) > 0.01 ? delta : a.key.localeCompare(b.key);
       });
-  }
-
-  function laneBounds(sourceX, targetX, direction, count, spacing) {
-    const near = sourceX + direction * 12;
-    const far = targetX - direction * 18;
-    const low = Math.min(near, far);
-    const high = Math.max(near, far);
-    const needed = Math.max(0, count - 1) * spacing;
-    return { low, high, available: Math.max(0, high - low), needed };
   }
 
   function uniqueSourceLane(edge, edges, pairs, cols, points) {
@@ -97,25 +88,14 @@
     const index = siblings.findIndex(item => item.key === edge.key);
     if (index < 0) return points;
 
-    const direction = edgeDirection(edge, pairs, cols) || (secondTurn.x >= first.x ? 1 : -1);
-    const requested = verticalSpacing();
-    const bounds = laneBounds(first.x, points.at(-1).x, direction, siblings.length, requested);
-    const spacing = bounds.needed <= bounds.available
-      ? requested
-      : Math.max(3, bounds.available / Math.max(1, siblings.length - 1));
+    const direction = edgeDirection(edge, pairs, cols) || (firstTurn.x >= first.x ? 1 : -1);
+    const spacing = verticalSpacing();
 
-    // Keep the family's lane group near the router's original first propagation lane,
-    // but guarantee a separate X lane for every outgoing prerequisite relationship.
-    const originalCenter = firstTurn.x;
-    const desiredStart = originalCenter - direction * spacing * (siblings.length - 1) / 2;
-    const minimumStart = direction > 0 ? bounds.low : bounds.high;
-    const maximumStart = direction > 0
-      ? bounds.high - spacing * (siblings.length - 1)
-      : bounds.low + spacing * (siblings.length - 1);
-    const start = direction > 0
-      ? clamp(desiredStart, minimumStart, Math.max(minimumStart, maximumStart))
-      : clamp(desiredStart, Math.min(minimumStart, maximumStart), minimumStart);
-    const laneX = start + direction * index * spacing;
+    // Every declared outgoing prerequisite owns a dedicated first propagation lane.
+    // Keep the family centered on the router's original lane and separate the lanes
+    // by the user's exact Vertical lines value. No trunk/branch consolidation occurs.
+    const centeredRank = index - (siblings.length - 1) / 2;
+    const laneX = firstTurn.x + centeredRank * spacing * direction;
 
     const next = clone(points);
     next[1].x = laneX;
@@ -132,7 +112,9 @@
     return serializeOrthogonal(separated) || base;
   };
 
-  // Rebuild immediately and after spacing changes so source lanes remain independent.
+  // Rebuild immediately and after either spacing control changes. Horizontal spacing
+  // continues to control the separate source-face ports; vertical spacing controls the
+  // dedicated first vertical propagation lanes.
   document.addEventListener('change', event => {
     const target = event.target;
     if (!(target instanceof HTMLInputElement)) return;
