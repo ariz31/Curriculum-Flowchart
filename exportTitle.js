@@ -1,12 +1,18 @@
 (() => {
   const NativeBlob = window.Blob;
-  const TITLE_SHIFT = 46;
-  const TITLE_HEIGHT = 36;
+  const MIN_TITLE_SIZE = 26;
+  const MAX_TITLE_SIZE = 40;
+  const TITLE_TOP_PADDING = 10;
+  const TITLE_DIVIDER_GAP = 11;
+  const TITLE_CONTENT_GAP = 14;
+
+  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
   const activeTitle = () => {
+    const fromSettings = window.CurriculumExportSettings?.getTitle?.();
     const fromDataset = document.documentElement.dataset.curriculumTitle;
     const fromGlobal = window.__CURRICULUM_TITLE__;
-    return String(fromDataset || fromGlobal || 'Curriculum Flowchart').trim() || 'Curriculum Flowchart';
+    return String(fromSettings || fromDataset || fromGlobal || 'Curriculum Flowchart').trim() || 'Curriculum Flowchart';
   };
 
   function addExportTitle(svgText) {
@@ -20,16 +26,20 @@
       const originalHeight = Number(root.getAttribute('height')) || (viewBox.length === 4 ? viewBox[3] : 0);
       if (!originalWidth || !originalHeight) return svgText;
 
+      const titleSize = clamp(originalWidth * 0.012, MIN_TITLE_SIZE, MAX_TITLE_SIZE);
+      const titleBaseline = TITLE_TOP_PADDING + titleSize;
+      const dividerY = titleBaseline + TITLE_DIVIDER_GAP;
+      const titleShift = dividerY + TITLE_CONTENT_GAP;
       const ns = 'http://www.w3.org/2000/svg';
-      const nextHeight = originalHeight + TITLE_SHIFT;
+      const nextHeight = originalHeight + titleShift;
       root.setAttribute('height', String(nextHeight));
       root.setAttribute('viewBox', `0 0 ${originalWidth} ${nextHeight}`);
 
       // Move the complete chart down as a unit. Keeping defs outside the translated group
-      // preserves marker/filter coordinate behavior while creating a real title-to-chart gap.
+      // preserves marker/filter coordinate behavior while creating a deliberate title gap.
       const chartGroup = documentXml.createElementNS(ns, 'g');
       chartGroup.setAttribute('id', 'export-chart-content');
-      chartGroup.setAttribute('transform', `translate(0 ${TITLE_SHIFT})`);
+      chartGroup.setAttribute('transform', `translate(0 ${titleShift})`);
       const movableChildren = [...root.children].filter(child => child.tagName.toLowerCase() !== 'defs');
       movableChildren.forEach(child => chartGroup.append(child));
       root.append(chartGroup);
@@ -48,21 +58,21 @@
 
       const title = documentXml.createElementNS(ns, 'text');
       title.setAttribute('x', String(originalWidth / 2));
-      title.setAttribute('y', '23');
+      title.setAttribute('y', String(titleBaseline));
       title.setAttribute('text-anchor', 'middle');
       title.setAttribute('font-family', 'Inter,Segoe UI,Arial,sans-serif');
-      title.setAttribute('font-size', '18');
-      title.setAttribute('font-weight', '750');
-      title.setAttribute('letter-spacing', '-0.25');
+      title.setAttribute('font-size', String(Number(titleSize.toFixed(2))));
+      title.setAttribute('font-weight', '800');
+      title.setAttribute('letter-spacing', '-0.35');
       title.setAttribute('fill', '#172033');
       title.textContent = activeTitle();
       group.append(title);
 
       const divider = documentXml.createElementNS(ns, 'line');
-      divider.setAttribute('x1', String(Math.max(24, originalWidth * 0.08)));
-      divider.setAttribute('x2', String(Math.min(originalWidth - 24, originalWidth * 0.92)));
-      divider.setAttribute('y1', String(TITLE_HEIGHT));
-      divider.setAttribute('y2', String(TITLE_HEIGHT));
+      divider.setAttribute('x1', String(Math.max(24, originalWidth * 0.07)));
+      divider.setAttribute('x2', String(Math.min(originalWidth - 24, originalWidth * 0.93)));
+      divider.setAttribute('y1', String(dividerY));
+      divider.setAttribute('y2', String(dividerY));
       divider.setAttribute('stroke', '#e2e8f0');
       divider.setAttribute('stroke-width', '1');
       group.append(divider);
