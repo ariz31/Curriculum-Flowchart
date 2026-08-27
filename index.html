@@ -6,6 +6,27 @@
     <meta name="description" content="Editable curriculum table and prerequisite flowchart maker." />
     <title>Curriculum Flowchart Maker</title>
     <link rel="stylesheet" href="/styles.css" />
+    <style>
+      #flow-panel.hide-node-code .node-code { display: none; }
+      #flow-panel.hide-node-description .node-title { display: none; }
+      #flow-panel.hide-node-units .node-units { display: none; }
+      #flow-panel.hide-node-track .node-track,
+      #flow-panel.hide-node-track .node-track-separator { display: none; }
+      #flow-panel.hide-node-units .course-node {
+        height: 62px;
+      }
+      #flow-panel.hide-node-units .node-meta {
+        margin-top: 2px;
+      }
+      .corequisite-line { stroke: #d92d20 !important; }
+      .coreq-arrowhead-shape { display: none !important; }
+      .legend-line.coreq {
+        border-top-color: #d92d20 !important;
+        border-bottom-color: #d92d20 !important;
+      }
+      .legend-line.coreq::before,
+      .legend-line.coreq::after { display: none !important; }
+    </style>
   </head>
   <body>
     <div id="app" class="app-shell">
@@ -101,6 +122,14 @@
                 <button class="toolbar-button compact" type="button" data-align="distribute-vertical">Distribute V</button>
               </div>
 
+              <div class="toolbar-group display-options" aria-label="Course box display options">
+                <span class="toolbar-label">Show</span>
+                <label class="switch"><input id="display-code-toggle" type="checkbox" checked /> Code</label>
+                <label class="switch"><input id="display-description-toggle" type="checkbox" checked /> Description</label>
+                <label class="switch"><input id="display-units-toggle" type="checkbox" checked /> Units</label>
+                <label class="switch"><input id="display-track-toggle" type="checkbox" checked /> Track</label>
+              </div>
+
               <div class="toolbar-group zoom-group" aria-label="Zoom tools">
                 <span class="toolbar-label">Zoom</span>
                 <button id="zoom-out" class="toolbar-button zoom-button" type="button" aria-label="Zoom out">−</button>
@@ -126,7 +155,7 @@
             <div class="legend" aria-label="Relationship legend">
               <span class="legend-item"><span class="legend-line arrow"></span>Prerequisite</span>
               <span class="legend-item"><span class="legend-line dashed arrow"></span>Prerequisite (elective)</span>
-              <span class="legend-item"><span class="legend-line coreq"></span>Corequisite · two-way</span>
+              <span class="legend-item"><span class="legend-line coreq"></span>Corequisite</span>
             </div>
           </div>
 
@@ -167,6 +196,224 @@
       </datalist>
     </div>
 
+    <script>
+      (() => {
+        const STORAGE_KEY = 'curriculum-flowchart:display-options:v1';
+        const BASE_NODE_HEIGHT = 78;
+        const COMPACT_NODE_HEIGHT = 62;
+        const defaults = { code: true, description: true, units: true, track: true };
+        let options = { ...defaults };
+        try {
+          const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || 'null');
+          if (stored && typeof stored === 'object') options = { ...defaults, ...stored };
+        } catch { /* use defaults */ }
+
+        const flowPanel = document.querySelector('#flow-panel');
+        const nodesLayer = document.querySelector('#nodes-layer');
+        const connectionsSvg = document.querySelector('#connections-svg');
+        const controls = {
+          code: document.querySelector('#display-code-toggle'),
+          description: document.querySelector('#display-description-toggle'),
+          units: document.querySelector('#display-units-toggle'),
+          track: document.querySelector('#display-track-toggle'),
+        };
+
+        const patchNodeMeta = () => {
+          if (!nodesLayer) return;
+          nodesLayer.querySelectorAll('.node-meta:not([data-display-patched])').forEach(meta => {
+            const text = (meta.textContent || '').trim();
+            const separatorIndex = text.indexOf(' · ');
+            const unitsText = separatorIndex >= 0 ? text.slice(0, separatorIndex) : text;
+            const trackText = separatorIndex >= 0 ? text.slice(separatorIndex + 3) : '';
+            meta.textContent = '';
+
+            const units = document.createElement('span');
+            units.className = 'node-units';
+            units.textContent = unitsText;
+            meta.append(units);
+
+            if (trackText) {
+              const separator = document.createElement('span');
+              separator.className = 'node-track-separator';
+              separator.textContent = ' · ';
+              meta.append(separator);
+
+              const track = document.createElement('span');
+              track.className = 'node-track';
+              track.textContent = trackText;
+              meta.append(track);
+            }
+            meta.setAttribute('data-display-patched', 'true');
+          });
+        };
+
+        const number = value => Number.parseFloat(value || '0');
+        const nodeGeometry = () => {
+          if (!nodesLayer) return [];
+          return [...nodesLayer.querySelectorAll('.course-node')].map(node => ({
+            top: number(node.style.top),
+            left: number(node.style.left),
+            right: number(node.style.left) + 184,
+            baselineBottom: number(node.style.top) + BASE_NODE_HEIGHT,
+          }));
+        };
+
+        const shiftRelationshipPath = (path, delta) => {
+          const original = path.getAttribute('data-display-base-d') || path.getAttribute('d') || '';
+          if (!path.hasAttribute('data-display-base-d')) path.setAttribute('data-display-base-d', original);
+          if (!delta) {
+            path.setAttribute('d', original);
+            return;
+          }
+          const centerShift = delta / 2;
+          let next = original.replace(/^M\s+(-?[\d.]+)\s+(-?[\d.]+)/, (_, x, y) => `M ${x} ${number(y) - centerShift}`);
+          const matches = [...next.matchAll(/V\s+(-?[\d.]+)\s+H\s+(-?[\d.]+)/g)];
+          if (matches.length) {
+            const last = matches[matches.length - 1];
+            const replacement = `V ${number(last[1]) - centerShift} H ${last[2]}`;
+            next = next.slice(0, last.index) + replacement + next.slice(last.index + last[0].length);
+          }
+          path.setAttribute('d', next);
+        };
+
+        const shiftCorequisitePath = (path, delta, boxes) => {
+          const original = path.getAttribute('data-display-base-d') || path.getAttribute('d') || '';
+          if (!path.hasAttribute('data-display-base-d')) path.setAttribute('data-display-base-d', original);
+          if (!delta) {
+            path.setAttribute('d', original);
+            return;
+          }
+          const match = original.match(/^M\s+(-?[\d.]+)\s+(-?[\d.]+)\s+V\s+(-?[\d.]+)/);
+          if (!match) return;
+          const x = number(match[1]);
+          let y1 = number(match[2]);
+          let y2 = number(match[3]);
+          const isBaselineBottom = y => boxes.some(box => Math.abs(box.baselineBottom - y) < 0.75 && x >= box.left - 8 && x <= box.right + 8);
+          if (isBaselineBottom(y1)) y1 -= delta;
+          if (isBaselineBottom(y2)) y2 -= delta;
+          path.setAttribute('d', `M ${match[1]} ${y1} V ${y2}`);
+        };
+
+        const patchCanvasGeometry = () => {
+          if (!connectionsSvg || !nodesLayer) return;
+          const delta = options.units ? 0 : BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
+          const boxes = nodeGeometry();
+          connectionsSvg.querySelectorAll('.relationship').forEach(path => shiftRelationshipPath(path, delta));
+          connectionsSvg.querySelectorAll('.corequisite-line').forEach(path => {
+            path.removeAttribute('marker-end');
+            path.setAttribute('stroke', '#d92d20');
+            shiftCorequisitePath(path, delta, boxes);
+          });
+        };
+
+        const apply = () => {
+          if (!flowPanel) return;
+          flowPanel.classList.toggle('hide-node-code', !options.code);
+          flowPanel.classList.toggle('hide-node-description', !options.description);
+          flowPanel.classList.toggle('hide-node-units', !options.units);
+          flowPanel.classList.toggle('hide-node-track', !options.track);
+          Object.entries(controls).forEach(([key, input]) => {
+            if (input instanceof HTMLInputElement) input.checked = Boolean(options[key]);
+          });
+          patchNodeMeta();
+          requestAnimationFrame(patchCanvasGeometry);
+        };
+
+        Object.entries(controls).forEach(([key, input]) => {
+          if (!(input instanceof HTMLInputElement)) return;
+          input.addEventListener('change', () => {
+            options[key] = input.checked;
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(options));
+            apply();
+          });
+        });
+
+        if (nodesLayer) new MutationObserver(() => {
+          patchNodeMeta();
+          requestAnimationFrame(patchCanvasGeometry);
+        }).observe(nodesLayer, { childList: true, subtree: true });
+        if (connectionsSvg) new MutationObserver(() => requestAnimationFrame(patchCanvasGeometry)).observe(connectionsSvg, { childList: true, subtree: true });
+
+        const filterExportSvg = svgText => {
+          try {
+            const documentXml = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+            const groups = [...documentXml.querySelectorAll('g')].filter(group => {
+              const rect = group.querySelector(':scope > rect');
+              return rect?.getAttribute('width') === '184' && rect?.getAttribute('height') === '78';
+            });
+            const exportBoxes = groups.map(group => {
+              const rect = group.querySelector(':scope > rect');
+              return {
+                top: number(rect?.getAttribute('y')),
+                left: number(rect?.getAttribute('x')),
+                right: number(rect?.getAttribute('x')) + 184,
+                baselineBottom: number(rect?.getAttribute('y')) + BASE_NODE_HEIGHT,
+              };
+            });
+
+            groups.forEach(group => {
+              const rect = group.querySelector(':scope > rect');
+              const texts = [...group.querySelectorAll(':scope > text')];
+              const code = texts.find(text => text.getAttribute('font-size') === '12' && text.getAttribute('font-weight') === '700');
+              const descriptions = texts.filter(text => text.getAttribute('font-size') === '10.5');
+              const meta = texts.find(text => text.getAttribute('font-size') === '9.5');
+
+              if (!options.code) code?.remove();
+              if (!options.description) descriptions.forEach(text => text.remove());
+
+              if (meta) {
+                const current = meta.textContent || '';
+                const separatorIndex = current.indexOf(' · ');
+                const unitsText = separatorIndex >= 0 ? current.slice(0, separatorIndex) : current;
+                const trackText = separatorIndex >= 0 ? current.slice(separatorIndex + 3) : '';
+                if (!options.units && !options.track) meta.remove();
+                else if (!options.units) {
+                  meta.textContent = options.track ? trackText : '';
+                  meta.setAttribute('y', String(number(meta.getAttribute('y')) - 10));
+                } else if (!options.track) meta.textContent = unitsText;
+              }
+              if (!options.units && rect) rect.setAttribute('height', String(COMPACT_NODE_HEIGHT));
+            });
+
+            const exportCorequisites = [...documentXml.querySelectorAll('path[marker-end*="export-coreq-arrow"]')];
+            exportCorequisites.forEach(path => {
+              path.classList.add('export-corequisite-line');
+              path.removeAttribute('marker-end');
+              path.setAttribute('stroke', '#d92d20');
+            });
+
+            if (!options.units) {
+              const delta = BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
+              documentXml.querySelectorAll('path[marker-end*="export-arrow"]').forEach(path => shiftRelationshipPath(path, delta));
+              documentXml.querySelectorAll('.export-corequisite-line').forEach(path => shiftCorequisitePath(path, delta, exportBoxes));
+            }
+            return new XMLSerializer().serializeToString(documentXml.documentElement);
+          } catch {
+            return svgText;
+          }
+        };
+
+        const downloadButton = document.querySelector('#download-image');
+        downloadButton?.addEventListener('click', () => {
+          const NativeBlob = window.Blob;
+          class DisplayFilteredBlob extends NativeBlob {
+            constructor(parts, blobOptions) {
+              let nextParts = parts;
+              if (blobOptions?.type?.startsWith('image/svg+xml') && parts?.length === 1 && typeof parts[0] === 'string' && parts[0].includes('export-arrow')) {
+                nextParts = [filterExportSvg(parts[0])];
+              }
+              super(nextParts, blobOptions);
+            }
+          }
+          window.Blob = DisplayFilteredBlob;
+          setTimeout(() => {
+            if (window.Blob === DisplayFilteredBlob) window.Blob = NativeBlob;
+          }, 0);
+        }, true);
+
+        apply();
+      })();
+    </script>
     <script type="module" src="/src/main.js"></script>
   </body>
 </html>

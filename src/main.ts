@@ -446,26 +446,111 @@ function edgeSourceUnit(edge: DependencyEdge, unitByNode: Map<string, LayoutUnit
 }
 
 function barycentricSortUnits(layoutColumns: LayoutUnit[][], edges: DependencyEdge[], unitByNode: Map<string, LayoutUnit>, pairs: CorequisitePair[]): void {
+  const allUnits = layoutColumns.flat();
+  const unitByKey = new Map(allUnits.map(unit => [unit.key, unit]));
+  const predecessors = new Map<string, Set<string>>();
+  const successors = new Map<string, Set<string>>();
+  const addLink = (from: string, to: string): void => {
+    if (from === to) return;
+    const outgoing = successors.get(from) ?? new Set<string>();
+    outgoing.add(to);
+    successors.set(from, outgoing);
+    const incoming = predecessors.get(to) ?? new Set<string>();
+    incoming.add(from);
+    predecessors.set(to, incoming);
+  };
+
+  for (const edge of edges) {
+    const source = edgeSourceUnit(edge, unitByNode, pairs);
+    const target = unitByNode.get(edge.toId);
+    if (!source || !target || source.key === target.key) continue;
+    addLink(source.key, target.key);
+  }
+
+  const semanticKey = (unit: LayoutUnit): string => unit.ids
+    .map(id => byId(id)?.courseNo ?? id)
+    .sort((a, b) => norm(a).localeCompare(norm(b)))
+    .join('|');
+
+  const hasDeclaredPrerequisites = (unit: LayoutUnit): boolean => unit.ids.some(id => {
+    const course = byId(id);
+    return Boolean(course && (course.prerequisites.length || course.electivePrerequisites.length));
+  });
+
+  const indegree = new Map(allUnits.map(unit => [unit.key, predecessors.get(unit.key)?.size ?? 0]));
+  const depth = new Map(allUnits.map(unit => [unit.key, 0]));
+  const processed = new Set<string>();
+  const queue = allUnits.filter(unit => (indegree.get(unit.key) ?? 0) === 0);
+  const queueSort = (a: LayoutUnit, b: LayoutUnit): number => a.columnIndex - b.columnIndex || semanticKey(a).localeCompare(semanticKey(b));
+  queue.sort(queueSort);
+
+  while (queue.length) {
+    const unit = queue.shift()!;
+    if (processed.has(unit.key)) continue;
+    processed.add(unit.key);
+    for (const nextKey of successors.get(unit.key) ?? []) {
+      const next = unitByKey.get(nextKey);
+      if (!next) continue;
+      depth.set(nextKey, Math.max(depth.get(nextKey) ?? 0, (depth.get(unit.key) ?? 0) + 1));
+      const remaining = Math.max(0, (indegree.get(nextKey) ?? 0) - 1);
+      indegree.set(nextKey, remaining);
+      if (remaining === 0) {
+        queue.push(next);
+        queue.sort(queueSort);
+      }
+    }
+  }
+
+  for (const unit of allUnits) {
+    if (processed.has(unit.key)) continue;
+    const upstreamDepths = [...(predecessors.get(unit.key) ?? [])]
+      .filter(key => processed.has(key))
+      .map(key => depth.get(key) ?? 0);
+    depth.set(unit.key, Math.max(1, ...upstreamDepths.map(value => value + 1)));
+  }
+
+  const metadata = new Map(allUnits.map(unit => [unit.key, {
+    root: !hasDeclaredPrerequisites(unit),
+    depth: depth.get(unit.key) ?? 0,
+    incoming: predecessors.get(unit.key)?.size ?? 0,
+    outgoing: successors.get(unit.key)?.size ?? 0,
+    semantic: semanticKey(unit),
+  }]));
+
+  layoutColumns.forEach(units => units.sort((a, b) => {
+    const am = metadata.get(a.key)!;
+    const bm = metadata.get(b.key)!;
+    if (am.root !== bm.root) return am.root ? -1 : 1;
+    if (am.depth !== bm.depth) return am.depth - bm.depth;
+    if (am.root && am.outgoing !== bm.outgoing) return bm.outgoing - am.outgoing;
+    if (!am.root && am.incoming !== bm.incoming) return am.incoming - bm.incoming;
+    return am.semantic.localeCompare(bm.semantic);
+  }));
+
   const neighborKeys = new Map<string, Set<string>>();
   const addNeighbor = (a: string, b: string): void => {
     const values = neighborKeys.get(a) ?? new Set<string>();
     values.add(b);
     neighborKeys.set(a, values);
   };
-  for (const edge of edges) {
-    const source = edgeSourceUnit(edge, unitByNode, pairs);
-    const target = unitByNode.get(edge.toId);
-    if (!source || !target || source.key === target.key) continue;
-    addNeighbor(source.key, target.key);
-    addNeighbor(target.key, source.key);
+  for (const [from, targets] of successors) {
+    for (const to of targets) {
+      addNeighbor(from, to);
+      addNeighbor(to, from);
+    }
   }
+
   const unitColumn = new Map<string, number>();
   layoutColumns.forEach((units, columnIndex) => units.forEach(unit => unitColumn.set(unit.key, columnIndex)));
+  const seedRank = new Map<string, number>();
+  layoutColumns.forEach(units => units.forEach((unit, index) => seedRank.set(unit.key, index)));
+
   const ranks = (): Map<string, number> => {
     const result = new Map<string, number>();
     layoutColumns.forEach(units => units.forEach((unit, index) => result.set(unit.key, index)));
     return result;
   };
+
   const sweep = (forward: boolean): void => {
     const indices = forward
       ? Array.from({ length: Math.max(0, layoutColumns.length - 1) }, (_, index) => index + 1)
@@ -473,7 +558,7 @@ function barycentricSortUnits(layoutColumns: LayoutUnit[][], edges: DependencyEd
     for (const columnIndex of indices) {
       const rank = ranks();
       const units = layoutColumns[columnIndex];
-      const scored = units.map((unit, fallback) => {
+      const scored = units.map(unit => {
         const values = [...(neighborKeys.get(unit.key) ?? [])]
           .filter(key => {
             const neighborColumn = unitColumn.get(key);
@@ -481,14 +566,26 @@ function barycentricSortUnits(layoutColumns: LayoutUnit[][], edges: DependencyEd
           })
           .map(key => rank.get(key))
           .filter((value): value is number => value !== undefined);
-        const score = values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : fallback;
-        return { unit, score, fallback };
+        const score = values.length
+          ? values.reduce((sum, value) => sum + value, 0) / values.length
+          : seedRank.get(unit.key) ?? 0;
+        return { unit, score };
       });
-      scored.sort((a, b) => a.score - b.score || a.fallback - b.fallback);
+      scored.sort((a, b) => {
+        const am = metadata.get(a.unit.key)!;
+        const bm = metadata.get(b.unit.key)!;
+        if (am.root !== bm.root) return am.root ? -1 : 1;
+        if (am.depth !== bm.depth) return am.depth - bm.depth;
+        if (am.root && am.outgoing !== bm.outgoing) return bm.outgoing - am.outgoing;
+        if (Math.abs(a.score - b.score) > 0.0001) return a.score - b.score;
+        if (!am.root && am.incoming !== bm.incoming) return am.incoming - bm.incoming;
+        return am.semantic.localeCompare(bm.semantic);
+      });
       layoutColumns[columnIndex] = scored.map(item => item.unit);
     }
   };
-  for (let pass = 0; pass < 10; pass += 1) {
+
+  for (let pass = 0; pass < 12; pass += 1) {
     sweep(true);
     sweep(false);
   }
