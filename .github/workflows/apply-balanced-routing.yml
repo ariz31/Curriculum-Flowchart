@@ -1,0 +1,48 @@
+name: Apply balanced routing
+
+on:
+  push:
+    branches:
+      - feat/balanced-routing
+    paths:
+      - scripts/balanced-routing.part1.patch
+      - scripts/balanced-routing.part2.patch
+      - .github/workflows/apply-balanced-routing.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: feat/balanced-routing
+          fetch-depth: 0
+
+      - name: Apply balanced routing patch
+        run: |
+          cat scripts/balanced-routing.part1.patch scripts/balanced-routing.part2.patch > /tmp/balanced-routing.patch
+          git apply --check /tmp/balanced-routing.patch
+          git apply /tmp/balanced-routing.patch
+
+      - name: Validate TypeScript and production build
+        run: |
+          npm install --package-lock=false
+          npm run typecheck
+          npm run build
+
+      - name: Commit implementation and remove staging files
+        run: |
+          rm scripts/balanced-routing.part1.patch scripts/balanced-routing.part2.patch
+          rm .github/workflows/apply-balanced-routing.yml
+          rmdir scripts 2>/dev/null || true
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "feat: add balanced prerequisite routing"
+          git push origin HEAD:feat/balanced-routing
