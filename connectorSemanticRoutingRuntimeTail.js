@@ -155,8 +155,6 @@
     return 0;
   }
 
-  // Every semantic relationship owns a node-face port. Pair-target edges are excluded
-  // only when the node itself is the synthetic target member, never at the real source.
   courseIncidentOffset = (nodeId, edge, edges) => {
     const pairs = corequisitePairs();
     const cols = columns();
@@ -238,7 +236,6 @@
       const span = step * Math.max(0, incoming.length - 1);
       const start = clamp(geometry.junctionY - span / 2, low, Math.max(low, high - span));
       return {
-        // Terminate at the nearest/front stroke and never the rear corequisite stroke.
         x: geometry.x + (direction > 0 ? -COREQ_HALF_GAP : COREQ_HALF_GAP),
         y: incoming.length > 1 ? start + index * step : geometry.junctionY,
       };
@@ -251,8 +248,6 @@
     };
   };
 
-  // Corequisite connectors are red, double, and arrowless. The two visible strokes
-  // are exactly the same strokes used by pair source/target anchors.
   corequisiteMarkup = (pair, exportMode = false) => {
     const geometry = pairGeometry(pair);
     if (!geometry) return '';
@@ -345,30 +340,31 @@
       if (!direction) continue;
       const key = `${record.edge.fromId}\u0000${direction}`;
       const list = groups.get(key) || [];
-      list.push({ ...record, direction });
+      list.push({ record, direction });
       groups.set(key, list);
     }
 
     for (const group of groups.values()) {
       if (group.length <= 1) continue;
       const orderedPorts = [...group].sort((a, b) => {
-        const delta = targetCenterY(a.edge, pairs) - targetCenterY(b.edge, pairs);
-        return Math.abs(delta) > 0.01 ? delta : a.edge.key.localeCompare(b.edge.key);
+        const delta = targetCenterY(a.record.edge, pairs) - targetCenterY(b.record.edge, pairs);
+        return Math.abs(delta) > 0.01 ? delta : a.record.edge.key.localeCompare(b.record.edge.key);
       });
-      const centerY = sourceCenterY(orderedPorts[0].edge, pairs);
+      const centerY = sourceCenterY(orderedPorts[0].record.edge, pairs);
       const nesting = [...group].sort((a, b) => {
-        const distance = Math.abs(targetCenterY(b.edge, pairs) - centerY) - Math.abs(targetCenterY(a.edge, pairs) - centerY);
+        const distance = Math.abs(targetCenterY(b.record.edge, pairs) - centerY) - Math.abs(targetCenterY(a.record.edge, pairs) - centerY);
         if (Math.abs(distance) > 0.01) return distance;
-        const delta = targetCenterY(a.edge, pairs) - targetCenterY(b.edge, pairs);
-        return Math.abs(delta) > 0.01 ? delta : a.edge.key.localeCompare(b.edge.key);
+        const delta = targetCenterY(a.record.edge, pairs) - targetCenterY(b.record.edge, pairs);
+        return Math.abs(delta) > 0.01 ? delta : a.record.edge.key.localeCompare(b.record.edge.key);
       });
-      const laneRank = new Map(nesting.map((record, index) => [record.edge.key, index]));
+      const laneRank = new Map(nesting.map((item, index) => [item.record.edge.key, index]));
 
-      for (const record of orderedPorts) {
+      for (const item of orderedPorts) {
+        const record = item.record;
         const source = sourceAnchor(record.edge, edges, pairs, cols);
         if (!source) continue;
         const rank = laneRank.get(record.edge.key) ?? 0;
-        const laneX = source.x + record.direction * (SOURCE_LANE_STUB + rank * verticalSpacing());
+        const laneX = source.x + item.direction * (SOURCE_LANE_STUB + rank * verticalSpacing());
         const next = firstLane(record.points, source, laneX);
         if (isOrthogonal(next)) record.points = next;
       }
@@ -418,7 +414,6 @@
   }
 
   function applySemanticInvariants() {
-    // First settle the existing obstacle and global spacing rules using the corrected anchors.
     window.CurriculumConnectorInvariants?.applyNow?.();
 
     const paths = [...svg.querySelectorAll('path.relationship')];
@@ -445,12 +440,9 @@
       };
     }).filter(Boolean);
 
-    // One semantic prerequisite = one balanced source port and one dedicated first lane.
     enforceBalancedSourceLanes(records, edges, pairs, cols);
     for (const record of records) updatePath(record, { cornerStyle: 'sharp', radius: 0 });
 
-    // Re-run global lane spacing on the dedicated source geometry, then enforce the
-    // compound-target front-side rule after every geometry writer has finished.
     window.CurriculumConnectorInvariants?.applyNow?.();
     for (const record of records) {
       let points = pathPoints(record.path);
@@ -476,7 +468,6 @@
       }
       requestAnimationFrame(() => later(depth - 1));
     };
-    // Existing endpoint invariants settle at 14 RAFs; this semantic pass is final.
     later(16);
   }
 
