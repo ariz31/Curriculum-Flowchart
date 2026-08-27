@@ -1,0 +1,222 @@
+-  candidates.push(TOP - 18);
+-  for (let index = 0; index < occupied.length - 1; index += 1) {
+-    const gapTop = occupied[index].y + H + ROUTE_CLEARANCE;
+-    const gapBottom = occupied[index + 1].y - ROUTE_CLEARANCE;
+-    if (gapBottom - gapTop >= ROUTE_TRACK_SPACING * 2) candidates.push((gapTop + gapBottom) / 2);
+-  }
+-  candidates.push(maxBottom + 24);
+-  candidates.sort((a, b) => Math.abs(a - (source.y + target.y) / 2) - Math.abs(b - (source.y + target.y) / 2));
+-  for (const candidate of candidates) {
+-    if (reserved.some(value => Math.abs(value - candidate) < ROUTE_TRACK_SPACING)) continue;
+-    if (horizontalClear(candidate, source.x, target.x, excluded)) return candidate;
+-  }
+-  let fallback = maxBottom + 24;
+-  while (reserved.some(value => Math.abs(value - fallback) < ROUTE_TRACK_SPACING)) fallback += ROUTE_TRACK_SPACING;
+-  return fallback;
++    .filter((position): position is NodePosition => Boolean(position));
++  const maxBottom = Math.max(TOP + H, ...visiblePositions.map(position => position.y + H));
++  const candidates = [
++    source.y,
++    target.y,
++    midpoint,
++    TOP - 18,
++    maxBottom + 24,
++    ...visiblePositions.flatMap(position => [
++      position.y - ROUTE_CLEARANCE - 3,
++      position.y + H + ROUTE_CLEARANCE + 3,
++    ]),
++  ];
++  const uniqueCandidates = [...new Set(candidates.map(value => Math.round(value * 2) / 2))]
++    .filter(value => horizontalClear(value, source.x, target.x, excluded));
++  uniqueCandidates.sort((a, b) => {
++    const aOutside = a < envelopeTop ? envelopeTop - a : a > envelopeBottom ? a - envelopeBottom : 0;
++    const bOutside = b < envelopeTop ? envelopeTop - b : b > envelopeBottom ? b - envelopeBottom : 0;
++    if ((aOutside === 0) !== (bOutside === 0)) return aOutside === 0 ? -1 : 1;
++    return aOutside - bOutside || Math.abs(a - midpoint) - Math.abs(b - midpoint) || a - b;
++  });
++  return uniqueCandidates.slice(0, 10);
++}
++
++function chooseBalancedPlan(
++  edge: DependencyEdge,
++  candidates: RoutePlan[],
++  edges: DependencyEdge[],
++  pairs: CorequisitePair[],
++  cols: Column[],
++  planned: PlannedRoute[],
++): { plan: RoutePlan; segments: RouteSegment[] } | null {
++  const source = sourceAnchor(edge, edges, pairs, cols);
++  const target = targetAnchor(edge, edges, pairs, cols);
++  if (!source || !target) return null;
++  const excluded = edgeExcludedIds(edge, pairs);
++  const bundleKey = edgeBundleKey(edge);
++  let best: { plan: RoutePlan; segments: RouteSegment[]; score: number; index: number } | null = null;
++  for (let index = 0; index < candidates.length; index += 1) {
++    const plan = candidates[index];
++    const result = routeScore(plan, source, target, excluded, planned, bundleKey);
++    if (!result) continue;
++    if (!best || result.score < best.score - 0.001 || (Math.abs(result.score - best.score) <= 0.001 && index < best.index)) {
++      best = { plan, segments: result.segments, score: result.score, index };
++    }
++  }
++  return best ? { plan: best.plan, segments: best.segments } : null;
+ }
+ 
+ function rebuildOptimizedRoutes(): void {
+@@ -754,75 +976,88 @@
+   const pairs = corequisitePairs();
+   const edges = dependencyEdges(pairs);
+   const plans = new Map<string, RoutePlan>();
+-  const adjacentGroups = new Map<string, DependencyEdge[]>();
+-  const sameColumnGroups = new Map<number, DependencyEdge[]>();
+-  const corridorEdges: DependencyEdge[] = [];
+-  for (const edge of edges) {
++  const planned: PlannedRoute[] = [];
++
++  const planningOrder = [...edges].sort((a, b) => {
++    const aSpan = Math.abs(edgeTargetColumn(a, cols) - edgeSourceColumn(a, pairs, cols));
++    const bSpan = Math.abs(edgeTargetColumn(b, cols) - edgeSourceColumn(b, pairs, cols));
++    return aSpan - bSpan || a.key.localeCompare(b.key);
++  });
++
++  for (const edge of planningOrder) {
+     const source = sourceAnchor(edge, edges, pairs, cols);
+     const target = targetAnchor(edge, edges, pairs, cols);
+     const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+     const targetColumn = edgeTargetColumn(edge, cols);
+     if (!source || !target || sourceColumn < 0 || targetColumn < 0) continue;
+-    const excluded = edgeExcludedIds(edge, pairs);
+-    if (Math.abs(source.y - target.y) <= 1.5 && horizontalClear(source.y, source.x, target.x, excluded)) {
+-      plans.set(edge.key, { kind: 'straight' });
+-      continue;
+-    }
++
++    const candidates: RoutePlan[] = [];
++    if (Math.abs(source.y - target.y) <= 1.5) candidates.push({ kind: 'straight' });
++
+     const span = Math.abs(targetColumn - sourceColumn);
+     if (span === 0) {
+-      const group = sameColumnGroups.get(sourceColumn) ?? [];
+-      group.push(edge);
+-      sameColumnGroups.set(sourceColumn, group);
++      for (const laneX of sameColumnLaneXs(sourceColumn, cols)) candidates.push({ kind: 'adjacent', laneX });
+     } else if (span === 1) {
+-      const key = `${Math.min(sourceColumn, targetColumn)}:${Math.max(sourceColumn, targetColumn)}`;
+-      const group = adjacentGroups.get(key) ?? [];
+-      group.push(edge);
+-      adjacentGroups.set(key, group);
+-    } else corridorEdges.push(edge);
+-  }
+-  for (const [columnIndex, group] of sameColumnGroups) {
+-    group.sort((a, b) => a.key.localeCompare(b.key));
+-    group.forEach((edge, index) => {
+-      const laneX = cols[columnIndex].x + W + 24 + index * ROUTE_TRACK_SPACING;
+-      plans.set(edge.key, { kind: 'adjacent', laneX });
+-    });
+-  }
+-  for (const [key, group] of adjacentGroups) {
+-    const [leftText, rightText] = key.split(':');
+-    const left = Number(leftText);
+-    const right = Number(rightText);
+-    const gapStart = cols[left].x + W;
+-    const gapEnd = cols[right].x;
+-    group.sort((a, b) => {
+-      const aa = sourceAnchor(a, edges, pairs, cols);
+-      const ab = targetAnchor(a, edges, pairs, cols);
+-      const ba = sourceAnchor(b, edges, pairs, cols);
+-      const bb = targetAnchor(b, edges, pairs, cols);
+-      return ((aa?.y ?? 0) + (ab?.y ?? 0)) - ((ba?.y ?? 0) + (bb?.y ?? 0)) || a.key.localeCompare(b.key);
+-    });
+-    group.forEach((edge, index) => {
+-      const laneX = gapStart + (index + 1) * ((gapEnd - gapStart) / (group.length + 1));
+-      plans.set(edge.key, { kind: 'adjacent', laneX });
+-    });
+-  }
+-  const reservedY: number[] = [];
+-  corridorEdges.sort((a, b) => a.key.localeCompare(b.key));
+-  for (const edge of corridorEdges) {
+-    const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+-    const targetColumn = edgeTargetColumn(edge, cols);
++      const boundary = Math.min(sourceColumn, targetColumn);
++      for (const laneX of boundaryLaneXs(boundary, cols)) candidates.push({ kind: 'adjacent', laneX });
++    } else {
++      const forward = targetColumn > sourceColumn;
++      const sourceBoundary = clamp(forward ? sourceColumn : sourceColumn - 1, 0, cols.length - 2);
++      const targetBoundary = clamp(forward ? targetColumn - 1 : targetColumn, 0, cols.length - 2);
++      const sourceLanes = boundaryLaneXs(sourceBoundary, cols);
++      const targetLanes = boundaryLaneXs(targetBoundary, cols);
++      const corridorYs = balancedCorridorYs(edge, edges, pairs, cols);
++      const lanePairs = sourceLanes.map((sourceLaneX, index) => ({
++        sourceLaneX,
++        targetLaneX: targetLanes[index % targetLanes.length],
++      }));
++      for (const corridorY of corridorYs) {
++        for (const pair of lanePairs) candidates.push({
++          kind: 'corridor',
++          sourceLaneX: pair.sourceLaneX,
++          targetLaneX: pair.targetLaneX,
++          corridorY,
++        });
++      }
++    }
++
++    const selectedPlan = chooseBalancedPlan(edge, candidates, edges, pairs, cols, planned);
++    if (selectedPlan) {
++      plans.set(edge.key, selectedPlan.plan);
++      planned.push({ edgeKey: edge.key, bundleKey: edgeBundleKey(edge), segments: selectedPlan.segments });
++      continue;
++    }
++
++    // Last-resort fallback: preserve node avoidance over compactness. This is the only
++    // case where Balanced Routing deliberately leaves the local source/target envelope.
++    const fallbackY = Math.max(
++      source.y,
++      target.y,
++      ...visibleCourses().map(course => (state.positions[course.id]?.y ?? TOP) + H),
++    ) + 24;
+     const forward = targetColumn > sourceColumn;
+-    const sourceNeighbor = clamp(sourceColumn + (forward ? 1 : -1), 0, cols.length - 1);
+-    const targetNeighbor = clamp(targetColumn + (forward ? -1 : 1), 0, cols.length - 1);
+-    const sourceLaneX = forward
+-      ? (cols[sourceColumn].x + W + cols[sourceNeighbor].x) / 2
+-      : (cols[sourceNeighbor].x + W + cols[sourceColumn].x) / 2;
+-    const targetLaneX = forward
+-      ? (cols[targetNeighbor].x + W + cols[targetColumn].x) / 2
+-      : (cols[targetColumn].x + W + cols[targetNeighbor].x) / 2;
+-    const corridorY = findClearCorridorY(edge, edges, pairs, cols, reservedY);
+-    reservedY.push(corridorY);
+-    plans.set(edge.key, { kind: 'corridor', sourceLaneX, targetLaneX, corridorY });
++    let sourceLaneX: number;
++    let targetLaneX: number;
++    if (span === 0 || cols.length < 2) {
++      const lanes = sameColumnLaneXs(sourceColumn, cols);
++      sourceLaneX = lanes[Math.floor(lanes.length / 2)];
++      targetLaneX = sourceLaneX;
++    } else {
++      const sourceBoundary = clamp(forward ? sourceColumn : sourceColumn - 1, 0, cols.length - 2);
++      const targetBoundary = clamp(forward ? targetColumn - 1 : targetColumn, 0, cols.length - 2);
++      const sourceLanes = boundaryLaneXs(sourceBoundary, cols);
++      const targetLanes = boundaryLaneXs(targetBoundary, cols);
++      sourceLaneX = sourceLanes[Math.floor(sourceLanes.length / 2)];
++      targetLaneX = targetLanes[Math.floor(targetLanes.length / 2)];
++    }
++    const fallback: RoutePlan = { kind: 'corridor', sourceLaneX, targetLaneX, corridorY: fallbackY };
++    const fallbackResult = chooseBalancedPlan(edge, [fallback], edges, pairs, cols, planned);
++    if (fallbackResult) {
++      plans.set(edge.key, fallbackResult.plan);
++      planned.push({ edgeKey: edge.key, bundleKey: edgeBundleKey(edge), segments: fallbackResult.segments });
++    }
+   }
++
+   routePlans = plans;
+ }
+ 
+@@ -1033,7 +1268,7 @@
+   const amount = selected.size;
+   selectionStatus.textContent = amount ? `${amount} course${amount === 1 ? '' : 's'} selected` : 'No courses selected';
+   if (multiSelect) flowHint.textContent = 'Multi-select is on. Tap courses to add/remove them; corequisite partners move together.';
+-  else if (state.layoutMode === 'optimized') flowHint.textContent = 'Optimized routing stays active while you move nodes. Corequisite pairs remain vertically coupled.';
++  else if (state.layoutMode === 'optimized') flowHint.textContent = 'Balanced routing stays active while you move nodes. Short local paths are preferred and corequisite pairs remain vertically coupled.';
+   else if (amount >= 2) flowHint.textContent = 'Alignment tools apply to selected courses. Pinch to zoom or drag empty space to pan.';
+   else flowHint.textContent = 'Tap a course to select. Drag empty space to pan. Pinch with two fingers to zoom.';
+   document.querySelectorAll<HTMLButtonElement>('[data-align]').forEach(button => { button.disabled = button.dataset.align?.startsWith('distribute') ? amount < 3 : amount < 2; });
