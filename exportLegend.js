@@ -5,13 +5,73 @@
   const canvasHeight = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height');
   const EXPORT_EXTRA_SCALE = 2;
   const MAX_EXPORT_DIMENSION = 16384;
+  const COREQ_HALF_GAP = 5;
+  const COREQ_LEGEND_HALF_GAP = 4;
   let highResolutionExportArmed = false;
+
+  const coreqStartX = path => {
+    const match = (path.getAttribute('d') || '').match(/^\s*M\s*(-?[\d.]+)/);
+    return match ? Number.parseFloat(match[1]) : null;
+  };
+
+  const replaceStartX = (d, x) => String(d || '').replace(/^\s*M\s*-?[\d.]+/, `M ${Number(x.toFixed(3))}`);
+
+  function setCoreqPathX(path, x) {
+    path.setAttribute('d', replaceStartX(path.getAttribute('d'), x));
+    const base = path.getAttribute('data-display-base-d');
+    if (base) path.setAttribute('data-display-base-d', replaceStartX(base, x));
+  }
+
+  function widenCorequisitePaths(root, selector) {
+    const paths = [...root.querySelectorAll(selector)];
+    for (let index = 0; index + 1 < paths.length; index += 2) {
+      const first = paths[index];
+      const second = paths[index + 1];
+      const firstX = coreqStartX(first);
+      const secondX = coreqStartX(second);
+      if (!Number.isFinite(firstX) || !Number.isFinite(secondX)) continue;
+      const center = (firstX + secondX) / 2;
+      if (firstX <= secondX) {
+        setCoreqPathX(first, center - COREQ_HALF_GAP);
+        setCoreqPathX(second, center + COREQ_HALF_GAP);
+      } else {
+        setCoreqPathX(first, center + COREQ_HALF_GAP);
+        setCoreqPathX(second, center - COREQ_HALF_GAP);
+      }
+    }
+  }
+
+  function installCorequisiteLineSpacing() {
+    const connectionsSvg = document.querySelector('#connections-svg');
+    if (!(connectionsSvg instanceof SVGSVGElement)) return;
+
+    const style = document.createElement('style');
+    style.textContent = '.legend-line.coreq { height: 10px !important; }';
+    document.head.append(style);
+
+    let scheduled = false;
+    const apply = () => {
+      scheduled = false;
+      widenCorequisitePaths(connectionsSvg, 'path.corequisite-line');
+    };
+    const schedule = () => {
+      if (scheduled) return;
+      scheduled = true;
+      requestAnimationFrame(() => requestAnimationFrame(apply));
+    };
+
+    new MutationObserver(schedule).observe(connectionsSvg, { childList: true, subtree: true });
+    document.querySelector('#display-units-toggle')?.addEventListener('change', schedule);
+    schedule();
+  }
 
   function addExportLegend(svgText) {
     try {
       const documentXml = new DOMParser().parseFromString(svgText, 'image/svg+xml');
       const root = documentXml.documentElement;
       if (root.querySelector('#export-legend')) return svgText;
+
+      widenCorequisitePaths(root, 'path[marker-end*="export-coreq-arrow"]');
 
       const viewBox = (root.getAttribute('viewBox') || '').trim().split(/\s+/).map(Number);
       const width = Number(root.getAttribute('width')) || (viewBox.length === 4 ? viewBox[2] : 0);
@@ -78,14 +138,14 @@
       group.append(makeText('Prerequisite (elective)', x + 80, rows[1] + 3.5));
 
       const coreqTop = documentXml.createElementNS(ns, 'path');
-      coreqTop.setAttribute('d', `M ${lineX1} ${rows[2] - 2.5} H ${lineX2}`);
+      coreqTop.setAttribute('d', `M ${lineX1} ${rows[2] - COREQ_LEGEND_HALF_GAP} H ${lineX2}`);
       coreqTop.setAttribute('fill', 'none');
       coreqTop.setAttribute('stroke', '#d92d20');
       coreqTop.setAttribute('stroke-width', '1.8');
       group.append(coreqTop);
 
       const coreqBottom = documentXml.createElementNS(ns, 'path');
-      coreqBottom.setAttribute('d', `M ${lineX1} ${rows[2] + 2.5} H ${lineX2}`);
+      coreqBottom.setAttribute('d', `M ${lineX1} ${rows[2] + COREQ_LEGEND_HALF_GAP} H ${lineX2}`);
       coreqBottom.setAttribute('fill', 'none');
       coreqBottom.setAttribute('stroke', '#d92d20');
       coreqBottom.setAttribute('stroke-width', '1.8');
@@ -301,5 +361,6 @@
     window.addEventListener('orientationchange', notifyResize);
   }
 
+  installCorequisiteLineSpacing();
   installFullscreenCanvas();
 })();
