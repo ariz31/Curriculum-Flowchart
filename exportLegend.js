@@ -167,4 +167,139 @@
   }
 
   window.Blob = LegendBlob;
+
+  function installFullscreenCanvas() {
+    const flowPanel = document.querySelector('#flow-panel');
+    const zoomGroup = document.querySelector('.zoom-group');
+    if (!(flowPanel instanceof HTMLElement) || !(zoomGroup instanceof HTMLElement) || document.querySelector('#fullscreen-canvas')) return;
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #flow-panel:fullscreen,
+      #flow-panel.flow-panel-fallback-fullscreen {
+        width: 100vw !important;
+        height: 100vh !important;
+        max-width: none !important;
+        margin: 0 !important;
+        padding: 10px !important;
+        background: #ffffff;
+        overflow: hidden !important;
+        display: flex !important;
+        flex-direction: column;
+      }
+      #flow-panel:fullscreen .flow-toolbar,
+      #flow-panel:fullscreen .flow-help,
+      #flow-panel:fullscreen .semester-shade-key,
+      #flow-panel.flow-panel-fallback-fullscreen .flow-toolbar,
+      #flow-panel.flow-panel-fallback-fullscreen .flow-help,
+      #flow-panel.flow-panel-fallback-fullscreen .semester-shade-key {
+        flex: 0 0 auto;
+      }
+      #flow-panel:fullscreen .canvas-viewport,
+      #flow-panel.flow-panel-fallback-fullscreen .canvas-viewport {
+        flex: 1 1 auto;
+        height: auto !important;
+        min-height: 0 !important;
+        max-height: none !important;
+        border-radius: 8px;
+      }
+      #flow-panel.flow-panel-fallback-fullscreen {
+        position: fixed !important;
+        inset: 0 !important;
+        z-index: 10000 !important;
+      }
+      body.flow-panel-fallback-active {
+        overflow: hidden !important;
+      }
+      @media (max-width: 760px) {
+        #flow-panel:fullscreen,
+        #flow-panel.flow-panel-fallback-fullscreen {
+          padding: 6px !important;
+        }
+        #flow-panel:fullscreen .flow-toolbar,
+        #flow-panel.flow-panel-fallback-fullscreen .flow-toolbar {
+          margin-left: 0 !important;
+          margin-right: 0 !important;
+        }
+      }
+    `;
+    document.head.append(style);
+
+    const button = document.createElement('button');
+    button.id = 'fullscreen-canvas';
+    button.className = 'toolbar-button';
+    button.type = 'button';
+    button.textContent = 'Full screen';
+    button.title = 'Open the curriculum canvas and tools in full screen';
+    button.setAttribute('aria-label', 'Open curriculum canvas in full screen');
+    button.setAttribute('aria-pressed', 'false');
+    zoomGroup.append(button);
+
+    const fallbackClass = 'flow-panel-fallback-fullscreen';
+    const fallbackBodyClass = 'flow-panel-fallback-active';
+    const nativeFullscreenElement = () => document.fullscreenElement || document.webkitFullscreenElement || null;
+    const isActive = () => nativeFullscreenElement() === flowPanel || flowPanel.classList.contains(fallbackClass);
+
+    const notifyResize = () => {
+      requestAnimationFrame(() => {
+        window.dispatchEvent(new Event('resize'));
+        requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+      });
+    };
+
+    const updateButton = () => {
+      const active = isActive();
+      button.textContent = active ? 'Exit full screen' : 'Full screen';
+      button.setAttribute('aria-label', active ? 'Exit full screen curriculum canvas' : 'Open curriculum canvas in full screen');
+      button.setAttribute('aria-pressed', String(active));
+      button.classList.toggle('active', active);
+      notifyResize();
+    };
+
+    const enterFallback = () => {
+      flowPanel.classList.add(fallbackClass);
+      document.body.classList.add(fallbackBodyClass);
+      updateButton();
+    };
+
+    const exitFallback = () => {
+      flowPanel.classList.remove(fallbackClass);
+      document.body.classList.remove(fallbackBodyClass);
+      updateButton();
+    };
+
+    button.addEventListener('click', async () => {
+      if (flowPanel.classList.contains(fallbackClass)) {
+        exitFallback();
+        return;
+      }
+
+      if (nativeFullscreenElement() === flowPanel) {
+        try {
+          if (document.exitFullscreen) await document.exitFullscreen();
+          else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+        } catch {
+          exitFallback();
+        }
+        return;
+      }
+
+      try {
+        if (flowPanel.requestFullscreen) await flowPanel.requestFullscreen({ navigationUI: 'hide' });
+        else if (flowPanel.webkitRequestFullscreen) flowPanel.webkitRequestFullscreen();
+        else enterFallback();
+      } catch {
+        enterFallback();
+      }
+    });
+
+    document.addEventListener('fullscreenchange', updateButton);
+    document.addEventListener('webkitfullscreenchange', updateButton);
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape' && flowPanel.classList.contains(fallbackClass)) exitFallback();
+    });
+    window.addEventListener('orientationchange', notifyResize);
+  }
+
+  installFullscreenCanvas();
 })();
