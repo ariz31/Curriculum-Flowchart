@@ -6,7 +6,7 @@
   const NODE_CLEARANCE = 10;
   const DEFAULT_LANE_SPACING = 7;
   const MIN_LANE_SPACING = 3;
-  const MAX_LANE_SPACING = 20;
+  const MAX_LANE_SPACING = 30;
   const EPSILON = 0.75;
   const CURRICULUM_LIBRARY_KEY = 'curriculum-flowchart:curricula:v1';
   const LANE_SPACING_KEY = 'curriculum-flowchart:vertical-lane-spacing:v1';
