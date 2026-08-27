@@ -1,5 +1,11 @@
 (() => {
   const NativeBlob = window.Blob;
+  const NativeCreateElement = Document.prototype.createElement;
+  const canvasWidth = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width');
+  const canvasHeight = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height');
+  const EXPORT_EXTRA_SCALE = 2;
+  const MAX_EXPORT_DIMENSION = 16384;
+  let highResolutionExportArmed = false;
 
   function addExportLegend(svgText) {
     try {
@@ -92,6 +98,58 @@
       return svgText;
     }
   }
+
+  function prepareHighResolutionCanvas(canvas) {
+    if (!canvasWidth?.get || !canvasWidth?.set || !canvasHeight?.get || !canvasHeight?.set) return;
+    let requestedWidth = 0;
+    let requestedHeight = 0;
+
+    Object.defineProperty(canvas, 'width', {
+      configurable: true,
+      get() {
+        return canvasWidth.get.call(canvas);
+      },
+      set(value) {
+        requestedWidth = Math.max(1, Number(value) || 1);
+        canvasWidth.set.call(canvas, requestedWidth);
+      },
+    });
+
+    Object.defineProperty(canvas, 'height', {
+      configurable: true,
+      get() {
+        return canvasHeight.get.call(canvas);
+      },
+      set(value) {
+        requestedHeight = Math.max(1, Number(value) || 1);
+        const width = Math.max(1, requestedWidth || canvasWidth.get.call(canvas));
+        const scale = Math.max(
+          1,
+          Math.min(
+            EXPORT_EXTRA_SCALE,
+            MAX_EXPORT_DIMENSION / width,
+            MAX_EXPORT_DIMENSION / requestedHeight,
+          ),
+        );
+        canvasWidth.set.call(canvas, Math.max(1, Math.round(width * scale)));
+        canvasHeight.set.call(canvas, Math.max(1, Math.round(requestedHeight * scale)));
+      },
+    });
+  }
+
+  Document.prototype.createElement = function patchedCreateElement(tagName, options) {
+    const element = NativeCreateElement.call(this, tagName, options);
+    if (highResolutionExportArmed && String(tagName).toLowerCase() === 'canvas' && element instanceof HTMLCanvasElement) {
+      highResolutionExportArmed = false;
+      prepareHighResolutionCanvas(element);
+    }
+    return element;
+  };
+
+  document.querySelector('#download-image')?.addEventListener('click', () => {
+    highResolutionExportArmed = true;
+    window.setTimeout(() => { highResolutionExportArmed = false; }, 1000);
+  }, true);
 
   class LegendBlob extends NativeBlob {
     constructor(parts, options) {
