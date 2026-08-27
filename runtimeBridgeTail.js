@@ -189,3 +189,79 @@
 
   installButtons();
 })();
+
+;(() => {
+  const PORT_MAX_STEP = 16;
+  const PORT_USABLE_SPAN = Math.min(54, H - 24);
+
+  const sideForCourseEdge = (nodeId, edge, pairs, cols) => {
+    const sourceColumn = edgeSourceColumn(edge, pairs, cols);
+    const targetColumn = edgeTargetColumn(edge, cols);
+    if (sourceColumn < 0 || targetColumn < 0) return null;
+    const forward = targetColumn >= sourceColumn;
+    if (edge.sourceKind === 'course' && edge.fromId === nodeId) return forward ? 'right' : 'left';
+    if (edge.toId === nodeId) return forward ? 'left' : 'right';
+    return null;
+  };
+
+  const counterpartCenterY = (nodeId, edge, pairs) => {
+    if (edge.sourceKind === 'course' && edge.fromId === nodeId) {
+      const target = state.positions[edge.toId];
+      return target ? target.y + H / 2 : 0;
+    }
+    if (edge.toId === nodeId) {
+      if (edge.sourceKind === 'course') {
+        const source = state.positions[edge.fromId];
+        return source ? source.y + H / 2 : 0;
+      }
+      const pair = pairByKey(edge.pairKey, pairs);
+      const geometry = pair ? pairGeometry(pair) : null;
+      return geometry?.junctionY ?? 0;
+    }
+    return 0;
+  };
+
+  courseIncidentOffset = (nodeId, edge, edges) => {
+    const pairs = corequisitePairs();
+    const cols = columns();
+    const side = sideForCourseEdge(nodeId, edge, pairs, cols);
+    if (!side) return 0;
+
+    const incident = edges
+      .filter(item => {
+        const attached = (item.sourceKind === 'course' && item.fromId === nodeId) || item.toId === nodeId;
+        return attached && sideForCourseEdge(nodeId, item, pairs, cols) === side;
+      })
+      .sort((a, b) => {
+        const yDifference = counterpartCenterY(nodeId, a, pairs) - counterpartCenterY(nodeId, b, pairs);
+        return Math.abs(yDifference) > 0.01 ? yDifference : a.key.localeCompare(b.key);
+      });
+
+    if (incident.length <= 1) return 0;
+    const index = Math.max(0, incident.findIndex(item => item.key === edge.key));
+    const step = Math.min(PORT_MAX_STEP, PORT_USABLE_SPAN / Math.max(1, incident.length - 1));
+    return (index - (incident.length - 1) / 2) * step;
+  };
+
+  const hygiene = window.CurriculumUntangleV2;
+  let scheduled = false;
+  const scheduleAutomaticHygiene = () => {
+    if (!hygiene || scheduled) return;
+    scheduled = true;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      scheduled = false;
+      hygiene.setActive(true);
+      hygiene.runPropagation();
+    }));
+  };
+
+  const connectionsSvg = document.querySelector('#connections-svg');
+  const nodesLayer = document.querySelector('#nodes-layer');
+  if (connectionsSvg) new MutationObserver(scheduleAutomaticHygiene).observe(connectionsSvg, { childList: true, subtree: true });
+  if (nodesLayer) new MutationObserver(scheduleAutomaticHygiene).observe(nodesLayer, { childList: true, subtree: true });
+  document.querySelector('#display-units-toggle')?.addEventListener('change', scheduleAutomaticHygiene);
+
+  if (hygiene) hygiene.setActive(true);
+  renderFlow();
+  scheduleAutomaticHygiene();
+})();
