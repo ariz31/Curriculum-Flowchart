@@ -18,6 +18,14 @@
       #flow-panel.hide-node-units .node-meta {
         margin-top: 2px;
       }
+      .corequisite-line { stroke: #d92d20 !important; }
+      .coreq-arrowhead-shape { display: none !important; }
+      .legend-line.coreq {
+        border-top-color: #d92d20 !important;
+        border-bottom-color: #d92d20 !important;
+      }
+      .legend-line.coreq::before,
+      .legend-line.coreq::after { display: none !important; }
     </style>
   </head>
   <body>
@@ -147,7 +155,7 @@
             <div class="legend" aria-label="Relationship legend">
               <span class="legend-item"><span class="legend-line arrow"></span>Prerequisite</span>
               <span class="legend-item"><span class="legend-line dashed arrow"></span>Prerequisite (elective)</span>
-              <span class="legend-item"><span class="legend-line coreq"></span>Corequisite · two-way</span>
+              <span class="legend-item"><span class="legend-line coreq"></span>Corequisite</span>
             </div>
           </div>
 
@@ -291,7 +299,11 @@
           const delta = options.units ? 0 : BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
           const boxes = nodeGeometry();
           connectionsSvg.querySelectorAll('.relationship').forEach(path => shiftRelationshipPath(path, delta));
-          connectionsSvg.querySelectorAll('.corequisite-line').forEach(path => shiftCorequisitePath(path, delta, boxes));
+          connectionsSvg.querySelectorAll('.corequisite-line').forEach(path => {
+            path.removeAttribute('marker-end');
+            path.setAttribute('stroke', '#d92d20');
+            shiftCorequisitePath(path, delta, boxes);
+          });
         };
 
         const apply = () => {
@@ -363,10 +375,17 @@
               if (!options.units && rect) rect.setAttribute('height', String(COMPACT_NODE_HEIGHT));
             });
 
+            const exportCorequisites = [...documentXml.querySelectorAll('path[marker-end*="export-coreq-arrow"]')];
+            exportCorequisites.forEach(path => {
+              path.classList.add('export-corequisite-line');
+              path.removeAttribute('marker-end');
+              path.setAttribute('stroke', '#d92d20');
+            });
+
             if (!options.units) {
               const delta = BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
               documentXml.querySelectorAll('path[marker-end*="export-arrow"]').forEach(path => shiftRelationshipPath(path, delta));
-              documentXml.querySelectorAll('path[marker-end*="export-coreq-arrow"]').forEach(path => shiftCorequisitePath(path, delta, exportBoxes));
+              documentXml.querySelectorAll('.export-corequisite-line').forEach(path => shiftCorequisitePath(path, delta, exportBoxes));
             }
             return new XMLSerializer().serializeToString(documentXml.documentElement);
           } catch {
