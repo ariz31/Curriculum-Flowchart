@@ -1,5 +1,5 @@
 (() => {
-  const MAX_SPACING = 20;
+  const MAX_SPACING = 30;
   const MIN_SPACING = 3;
   const CURRICULUM_LIBRARY_KEY = 'curriculum-flowchart:curricula:v1';
   const VERTICAL_KEY = 'curriculum-flowchart:vertical-lane-spacing:v1';
