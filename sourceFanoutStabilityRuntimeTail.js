@@ -1,10 +1,11 @@
-
 ;(() => {
   const EPS = 0.5;
   const DEFAULT_SPACING = 7;
   const NODE_CLEARANCE = 10;
   const SOURCE_FACE_MARGIN = 11;
+  const PAIR_ANCHOR_MARGIN = 8;
   const SOURCE_LANE_STUB = 14;
+  const MAX_LANE_SEARCH_STEPS = 60;
 
   const clone = value => JSON.parse(JSON.stringify(value));
   const number = value => Number.parseFloat(String(value ?? '0'));
@@ -205,16 +206,46 @@
     return [];
   }
 
-  function portAssignments(group, sourcePosition, pairs) {
+  function sourceDescriptor(edge, pairs) {
+    if (edge.sourceKind === 'course') {
+      const position = state.positions[edge.fromId];
+      if (!position) return null;
+      return {
+        kind: 'course',
+        key: `course:${edge.fromId}`,
+        centerY: position.y + H / 2,
+        minY: position.y + SOURCE_FACE_MARGIN,
+        maxY: position.y + H - SOURCE_FACE_MARGIN,
+      };
+    }
+    if (edge.sourceKind === 'pair' && edge.pairKey) {
+      const pair = pairByKey(edge.pairKey, pairs);
+      const geometry = pair ? pairGeometry(pair) : null;
+      if (!pair || !geometry) return null;
+      const low = Math.min(geometry.upperBottom + PAIR_ANCHOR_MARGIN, geometry.lowerTop - PAIR_ANCHOR_MARGIN);
+      const high = Math.max(geometry.upperBottom + PAIR_ANCHOR_MARGIN, geometry.lowerTop - PAIR_ANCHOR_MARGIN);
+      return {
+        kind: 'pair',
+        key: `pair:${edge.pairKey}`,
+        centerY: geometry.junctionY,
+        minY: low,
+        maxY: high,
+        pair,
+        geometry,
+      };
+    }
+    return null;
+  }
+
+  function portAssignments(group, descriptor, pairs) {
     const ordered = [...group].sort((a, b) => {
       const delta = targetCenterY(a.edge, pairs) - targetCenterY(b.edge, pairs);
       return Math.abs(delta) > 0.01 ? delta : a.edge.key.localeCompare(b.edge.key);
     });
-    if (ordered.length === 1) return new Map([[ordered[0].edge.key, sourcePosition.y + H / 2]]);
+    if (ordered.length === 1) return new Map([[ordered[0].edge.key, descriptor.centerY]]);
 
-    const centerY = sourcePosition.y + H / 2;
-    const minY = sourcePosition.y + SOURCE_FACE_MARGIN;
-    const maxY = sourcePosition.y + H - SOURCE_FACE_MARGIN;
+    const minY = descriptor.minY;
+    const maxY = descriptor.maxY;
     const usable = Math.max(0, maxY - minY);
     const step = Math.min(horizontalSpacing(), usable / Math.max(1, ordered.length - 1));
     const span = step * (ordered.length - 1);
@@ -222,21 +253,22 @@
     const minTarget = Math.min(...targets);
     const maxTarget = Math.max(...targets);
     const meanTarget = targets.reduce((sum, value) => sum + value, 0) / targets.length;
-    let desiredCenter = centerY;
-    if (maxTarget < centerY - EPS) desiredCenter = minY + span / 2;
-    else if (minTarget > centerY + EPS) desiredCenter = maxY - span / 2;
+    let desiredCenter = descriptor.centerY;
+
+    if (maxTarget < descriptor.centerY - EPS) desiredCenter = minY + span / 2;
+    else if (minTarget > descriptor.centerY + EPS) desiredCenter = maxY - span / 2;
     else {
       const slack = Math.max(0, usable - span) / 2;
-      desiredCenter += clamp((meanTarget - centerY) / Math.max(H * 2, 1), -1, 1) * slack;
+      desiredCenter += clamp((meanTarget - descriptor.centerY) / Math.max(H * 2, 1), -1, 1) * slack;
     }
+
     const start = clamp(desiredCenter - span / 2, minY, Math.max(minY, maxY - span));
     return new Map(ordered.map((item, index) => [item.edge.key, start + index * step]));
   }
 
-  function laneOrder(group, sourcePosition, pairs) {
-    const sourceCenter = sourcePosition.y + H / 2;
+  function laneOrder(group, descriptor, pairs) {
     return [...group].sort((a, b) => {
-      const distanceDelta = Math.abs(targetCenterY(b.edge, pairs) - sourceCenter) - Math.abs(targetCenterY(a.edge, pairs) - sourceCenter);
+      const distanceDelta = Math.abs(targetCenterY(b.edge, pairs) - descriptor.centerY) - Math.abs(targetCenterY(a.edge, pairs) - descriptor.centerY);
       if (Math.abs(distanceDelta) > 0.01) return distanceDelta;
       const targetDelta = targetCenterY(a.edge, pairs) - targetCenterY(b.edge, pairs);
       return Math.abs(targetDelta) > 0.01 ? targetDelta : a.edge.key.localeCompare(b.edge.key);
@@ -285,6 +317,13 @@
     ]);
   }
 
+  function updateInteraction(path) {
+    const edgeKey = path.dataset.edgeKey;
+    if (!edgeKey) return;
+    const hit = svg.querySelector(`.manual-route-hit[data-edge-key="${CSS.escape(edgeKey)}"]`);
+    if (hit instanceof SVGPathElement) hit.setAttribute('d', path.getAttribute('d') || '');
+  }
+
   function updatePath(path, points, currentAppearance) {
     const orthogonal = serializeOrthogonal(points);
     if (!orthogonal) return;
@@ -294,7 +333,45 @@
     path.setAttribute('d', currentAppearance.cornerStyle === 'rounded'
       ? roundedArcPath(points, currentAppearance.radius)
       : orthogonal);
+    updateInteraction(path);
   }
+
+  const basePairBranchAnchorForUnifiedFanout = pairBranchAnchor;
+  pairBranchAnchor = (pair, edge, edges) => {
+    const geometry = pairGeometry(pair);
+    if (!geometry || edge.sourceKind !== 'pair' || edge.pairKey !== pair.key) {
+      return basePairBranchAnchorForUnifiedFanout(pair, edge, edges);
+    }
+    const pairs = corequisitePairs();
+    const cols = columns();
+    const direction = edgeDirection(edge, pairs, cols) || 1;
+    const branches = edges
+      .filter(item => item.sourceKind === 'pair' && item.pairKey === pair.key && (edgeDirection(item, pairs, cols) || 1) === direction)
+      .sort((a, b) => {
+        const delta = targetCenterY(a, pairs) - targetCenterY(b, pairs);
+        return Math.abs(delta) > 0.01 ? delta : a.key.localeCompare(b.key);
+      });
+    const index = Math.max(0, branches.findIndex(item => item.key === edge.key));
+    const low = Math.min(geometry.upperBottom + PAIR_ANCHOR_MARGIN, geometry.lowerTop - PAIR_ANCHOR_MARGIN);
+    const high = Math.max(geometry.upperBottom + PAIR_ANCHOR_MARGIN, geometry.lowerTop - PAIR_ANCHOR_MARGIN);
+    const available = Math.max(0, high - low);
+    const step = branches.length > 1 ? Math.min(horizontalSpacing(), available / Math.max(1, branches.length - 1)) : 0;
+    const span = step * Math.max(0, branches.length - 1);
+    const targets = branches.map(item => targetCenterY(item, pairs));
+    const meanTarget = targets.length ? targets.reduce((sum, value) => sum + value, 0) / targets.length : geometry.junctionY;
+    let center = geometry.junctionY;
+    if (targets.length && Math.max(...targets) < geometry.junctionY - EPS) center = low + span / 2;
+    else if (targets.length && Math.min(...targets) > geometry.junctionY + EPS) center = high - span / 2;
+    else {
+      const slack = Math.max(0, available - span) / 2;
+      center += clamp((meanTarget - geometry.junctionY) / Math.max(H * 2, 1), -1, 1) * slack;
+    }
+    const start = clamp(center - span / 2, low, Math.max(low, high - span));
+    return {
+      x: geometry.x + direction * 3.5,
+      y: branches.length > 1 ? start + index * step : geometry.junctionY,
+    };
+  };
 
   function applySourceFanout() {
     const paths = [...svg.querySelectorAll('path.relationship')];
@@ -305,35 +382,37 @@
     const boxes = liveBoxes();
     const currentAppearance = appearance();
     const records = paths.map((path, index) => ({ path, edge: edges[index], points: pathPoints(path) }))
-      .filter(record => record.edge && record.edge.sourceKind === 'course' && isOrthogonal(record.points) && !window.CurriculumManualRouting?.hasManualRoute?.(record.edge.key));
+      .filter(record => record.edge && ['course', 'pair'].includes(record.edge.sourceKind) && isOrthogonal(record.points) && !window.CurriculumManualRouting?.hasManualRoute?.(record.edge.key));
 
     const groups = new Map();
     for (const record of records) {
       const direction = edgeDirection(record.edge, pairs, cols);
-      if (!direction) continue;
-      const key = `${record.edge.fromId}\u0000${direction}`;
+      const descriptor = sourceDescriptor(record.edge, pairs);
+      if (!direction || !descriptor) continue;
+      const key = `${descriptor.key}\u0000${direction}`;
       const list = groups.get(key) || [];
-      list.push({ ...record, direction });
+      list.push({ ...record, direction, descriptor });
       groups.set(key, list);
     }
 
     for (const group of groups.values()) {
       if (group.length <= 1) continue;
-      const sourcePosition = state.positions[group[0].edge.fromId];
-      if (!sourcePosition) continue;
-      const ports = portAssignments(group, sourcePosition, pairs);
-      const nesting = laneOrder(group, sourcePosition, pairs);
+      const descriptor = group[0].descriptor;
+      const ports = portAssignments(group, descriptor, pairs);
+      const nesting = laneOrder(group, descriptor, pairs);
       let previousLane = null;
 
       nesting.forEach((record, rank) => {
-        const portY = ports.get(record.edge.key) ?? sourcePosition.y + H / 2;
+        const portY = ports.get(record.edge.key) ?? descriptor.centerY;
         const sourceX = record.points[0].x;
         const desiredLane = sourceX + record.direction * (SOURCE_LANE_STUB + rank * verticalSpacing());
         const minimumOrderedLane = previousLane == null
           ? null
           : previousLane + record.direction * verticalSpacing();
         const candidates = [];
-        for (let step = 0; step <= 24; step += 1) candidates.push(desiredLane + record.direction * step * verticalSpacing());
+        for (let step = 0; step <= MAX_LANE_SEARCH_STEPS; step += 1) {
+          candidates.push(desiredLane + record.direction * step * verticalSpacing());
+        }
 
         let chosenPoints = null;
         let chosenLane = null;
@@ -373,7 +452,6 @@
       }
       requestAnimationFrame(() => later(depth - 1));
     };
-    // Node-clearance settles at nine RAFs; source fanout is the final ordering pass.
     later(12);
   }
 
