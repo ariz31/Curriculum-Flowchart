@@ -201,6 +201,9 @@
         const STORAGE_KEY = 'curriculum-flowchart:display-options:v1';
         const BASE_NODE_HEIGHT = 78;
         const COMPACT_NODE_HEIGHT = 62;
+        const NODE_WIDTH = 184;
+        const ROUTE_NODE_CLEARANCE = 10;
+        const ROUTE_LANE_STEP = 12;
         const defaults = { code: true, description: true, units: true, track: true };
         let options = { ...defaults };
         try {
@@ -211,6 +214,7 @@
         const flowPanel = document.querySelector('#flow-panel');
         const nodesLayer = document.querySelector('#nodes-layer');
         const connectionsSvg = document.querySelector('#connections-svg');
+        const flowCanvas = document.querySelector('#flow-canvas');
         const controls = {
           code: document.querySelector('#display-code-toggle'),
           description: document.querySelector('#display-description-toggle'),
@@ -248,14 +252,122 @@
         };
 
         const number = value => Number.parseFloat(value || '0');
+        const currentNodeHeight = () => options.units ? BASE_NODE_HEIGHT : COMPACT_NODE_HEIGHT;
         const nodeGeometry = () => {
           if (!nodesLayer) return [];
+          const height = currentNodeHeight();
           return [...nodesLayer.querySelectorAll('.course-node')].map(node => ({
             top: number(node.style.top),
+            bottom: number(node.style.top) + height,
             left: number(node.style.left),
-            right: number(node.style.left) + 184,
+            right: number(node.style.left) + NODE_WIDTH,
             baselineBottom: number(node.style.top) + BASE_NODE_HEIGHT,
           }));
+        };
+
+        const parseOrthogonalPath = d => {
+          const commands = [...d.matchAll(/([MHV])\s*(-?[\d.]+)(?:\s+(-?[\d.]+))?/g)];
+          if (!commands.length) return [];
+          const points = [];
+          let x = 0;
+          let y = 0;
+          for (const match of commands) {
+            if (match[1] === 'M') {
+              x = number(match[2]);
+              y = number(match[3]);
+            } else if (match[1] === 'H') x = number(match[2]);
+            else if (match[1] === 'V') y = number(match[2]);
+            points.push({ x, y });
+          }
+          return points;
+        };
+
+        const formatNumber = value => Number(value.toFixed(3)).toString();
+        const serializeOrthogonalPath = points => {
+          if (!points.length) return '';
+          let result = `M ${formatNumber(points[0].x)} ${formatNumber(points[0].y)}`;
+          for (let index = 1; index < points.length; index += 1) {
+            const previous = points[index - 1];
+            const point = points[index];
+            if (Math.abs(previous.y - point.y) < 0.001) result += ` H ${formatNumber(point.x)}`;
+            else if (Math.abs(previous.x - point.x) < 0.001) result += ` V ${formatNumber(point.y)}`;
+            else result += ` L ${formatNumber(point.x)} ${formatNumber(point.y)}`;
+          }
+          return result;
+        };
+
+        const pointTouchesBox = (point, box) => point.x >= box.left - 1 && point.x <= box.right + 1 && point.y >= box.top - 1 && point.y <= box.bottom + 1;
+        const verticalBlocked = (x, y1, y2, boxes) => {
+          const low = Math.min(y1, y2);
+          const high = Math.max(y1, y2);
+          return boxes.some(box => x > box.left - ROUTE_NODE_CLEARANCE && x < box.right + ROUTE_NODE_CLEARANCE && low < box.bottom + ROUTE_NODE_CLEARANCE && high > box.top - ROUTE_NODE_CLEARANCE);
+        };
+        const horizontalBlocked = (y, x1, x2, boxes, ignored = new Set()) => {
+          const left = Math.min(x1, x2);
+          const right = Math.max(x1, x2);
+          return boxes.some((box, index) => {
+            if (ignored.has(index)) return false;
+            return y > box.top - ROUTE_NODE_CLEARANCE && y < box.bottom + ROUTE_NODE_CLEARANCE && left < box.right + ROUTE_NODE_CLEARANCE && right > box.left - ROUTE_NODE_CLEARANCE;
+          });
+        };
+        const touchingBoxIndexes = (point, boxes) => new Set(boxes.map((box, index) => pointTouchesBox(point, box) ? index : -1).filter(index => index >= 0));
+
+        const verticalLaneCandidates = (currentX, boxes) => {
+          const values = new Set([currentX]);
+          for (let step = 1; step <= 24; step += 1) {
+            values.add(currentX - step * ROUTE_LANE_STEP);
+            values.add(currentX + step * ROUTE_LANE_STEP);
+          }
+          boxes.forEach(box => {
+            values.add(box.left - ROUTE_NODE_CLEARANCE - 2);
+            values.add(box.right + ROUTE_NODE_CLEARANCE + 2);
+          });
+          const maxRight = Math.max(NODE_WIDTH, ...boxes.map(box => box.right));
+          values.add(Math.max(8, Math.min(...boxes.map(box => box.left)) - ROUTE_NODE_CLEARANCE - 16));
+          values.add(maxRight + ROUTE_NODE_CLEARANCE + 16);
+          const canvasWidth = number(flowCanvas?.style.width) || flowCanvas?.clientWidth || maxRight + 100;
+          values.add(Math.max(8, canvasWidth - ROUTE_NODE_CLEARANCE - 4));
+          return [...values].filter(value => Number.isFinite(value) && value >= 6).sort((a, b) => Math.abs(a - currentX) - Math.abs(b - currentX));
+        };
+
+        const avoidVerticalNodeIntersections = (path, boxes) => {
+          const d = path.getAttribute('d') || '';
+          const points = parseOrthogonalPath(d);
+          if (points.length < 3) return;
+          let changed = false;
+
+          for (let index = 0; index < points.length - 1; index += 1) {
+            const start = points[index];
+            const end = points[index + 1];
+            if (Math.abs(start.x - end.x) > 0.001 || Math.abs(start.y - end.y) < 0.001) continue;
+            if (!verticalBlocked(start.x, start.y, end.y, boxes)) continue;
+
+            const previous = points[index - 1] || start;
+            const next = points[index + 2] || end;
+            const startIgnored = touchingBoxIndexes(previous, boxes);
+            const endIgnored = touchingBoxIndexes(next, boxes);
+            const candidates = verticalLaneCandidates(start.x, boxes);
+            let safeX = candidates.find(candidate => {
+              if (verticalBlocked(candidate, start.y, end.y, boxes)) return false;
+              if (index > 0 && horizontalBlocked(start.y, previous.x, candidate, boxes, startIgnored)) return false;
+              if (index + 2 < points.length && horizontalBlocked(end.y, candidate, next.x, boxes, endIgnored)) return false;
+              return true;
+            });
+
+            if (safeX === undefined) {
+              safeX = candidates.find(candidate => !verticalBlocked(candidate, start.y, end.y, boxes));
+            }
+            if (safeX === undefined) continue;
+
+            start.x = safeX;
+            end.x = safeX;
+            changed = true;
+          }
+
+          if (changed) {
+            path.setAttribute('d', serializeOrthogonalPath(points));
+            path.setAttribute('data-node-safe-routed', 'true');
+          } else path.removeAttribute('data-node-safe-routed');
         };
 
         const shiftRelationshipPath = (path, delta) => {
@@ -298,7 +410,10 @@
           if (!connectionsSvg || !nodesLayer) return;
           const delta = options.units ? 0 : BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
           const boxes = nodeGeometry();
-          connectionsSvg.querySelectorAll('.relationship').forEach(path => shiftRelationshipPath(path, delta));
+          connectionsSvg.querySelectorAll('.relationship').forEach(path => {
+            shiftRelationshipPath(path, delta);
+            avoidVerticalNodeIntersections(path, boxes);
+          });
           connectionsSvg.querySelectorAll('.corequisite-line').forEach(path => {
             path.removeAttribute('marker-end');
             path.setAttribute('stroke', '#d92d20');
@@ -343,11 +458,14 @@
             });
             const exportBoxes = groups.map(group => {
               const rect = group.querySelector(':scope > rect');
+              const top = number(rect?.getAttribute('y'));
+              const left = number(rect?.getAttribute('x'));
               return {
-                top: number(rect?.getAttribute('y')),
-                left: number(rect?.getAttribute('x')),
-                right: number(rect?.getAttribute('x')) + 184,
-                baselineBottom: number(rect?.getAttribute('y')) + BASE_NODE_HEIGHT,
+                top,
+                bottom: top + (options.units ? BASE_NODE_HEIGHT : COMPACT_NODE_HEIGHT),
+                left,
+                right: left + NODE_WIDTH,
+                baselineBottom: top + BASE_NODE_HEIGHT,
               };
             });
 
@@ -382,11 +500,13 @@
               path.setAttribute('stroke', '#d92d20');
             });
 
+            const exportRelationships = [...documentXml.querySelectorAll('path[marker-end*="export-arrow"]')];
             if (!options.units) {
               const delta = BASE_NODE_HEIGHT - COMPACT_NODE_HEIGHT;
-              documentXml.querySelectorAll('path[marker-end*="export-arrow"]').forEach(path => shiftRelationshipPath(path, delta));
+              exportRelationships.forEach(path => shiftRelationshipPath(path, delta));
               documentXml.querySelectorAll('.export-corequisite-line').forEach(path => shiftCorequisitePath(path, delta, exportBoxes));
             }
+            exportRelationships.forEach(path => avoidVerticalNodeIntersections(path, exportBoxes));
             return new XMLSerializer().serializeToString(documentXml.documentElement);
           } catch {
             return svgText;
