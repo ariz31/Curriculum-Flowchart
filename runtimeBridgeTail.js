@@ -9,12 +9,15 @@
   let pendingPointerSnapshot = null;
 
   const positionsEqual = (a, b) => JSON.stringify(a || {}) === JSON.stringify(b || {});
+  const manualRoutingState = () => window.CurriculumManualRouting?.exportState?.() ?? null;
+  const manualRoutingEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
   const snapshot = () => ({
     positions: clone(state.positions || {}),
     layoutMode: state.layoutMode,
     sortStrategy: state.sortStrategy || null,
     viewport: clone(state.viewport),
+    manualRouting: clone(manualRoutingState()),
   });
 
   const updateHistoryButtons = () => {
@@ -23,7 +26,9 @@
   };
 
   const pushHistory = (before, label = 'Move') => {
-    if (!before || positionsEqual(before.positions, state.positions)) return false;
+    if (!before) return false;
+    const currentManualRouting = manualRoutingState();
+    if (positionsEqual(before.positions, state.positions) && manualRoutingEqual(before.manualRouting, currentManualRouting)) return false;
     undoStack.push({ ...before, label });
     if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
     redoStack.length = 0;
@@ -37,6 +42,9 @@
     state.layoutMode = entry.layoutMode === 'optimized' ? 'optimized' : 'basic';
     state.sortStrategy = entry.sortStrategy || null;
     if (entry.viewport) state.viewport = clone(entry.viewport);
+    if (Object.prototype.hasOwnProperty.call(entry, 'manualRouting')) {
+      window.CurriculumManualRouting?.importState?.(entry.manualRouting, { render: false });
+    }
     selected.clear();
     afterManualPositionChange();
     save();
@@ -116,14 +124,14 @@
     undoButton.className = 'toolbar-button';
     undoButton.type = 'button';
     undoButton.textContent = 'Undo';
-    undoButton.title = 'Undo the last node movement or layout operation (Ctrl/Cmd+Z)';
+    undoButton.title = 'Undo the last node movement, route edit, or layout operation (Ctrl/Cmd+Z)';
 
     redoButton = document.createElement('button');
     redoButton.id = 'redo-layout-movement';
     redoButton.className = 'toolbar-button';
     redoButton.type = 'button';
     redoButton.textContent = 'Redo';
-    redoButton.title = 'Redo the last undone movement or layout operation (Ctrl/Cmd+Shift+Z or Ctrl+Y)';
+    redoButton.title = 'Redo the last undone movement, route edit, or layout operation (Ctrl/Cmd+Shift+Z or Ctrl+Y)';
 
     clearSelection.insertAdjacentElement('beforebegin', redoButton);
     redoButton.insertAdjacentElement('beforebegin', undoButton);
