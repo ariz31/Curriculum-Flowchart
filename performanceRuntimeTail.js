@@ -8,7 +8,6 @@
   const baseRenderEdgesForPerformance = renderEdges;
   const baseRebuildOptimizedRoutesForPerformance = rebuildOptimizedRoutes;
   const baseBuildExportSvgForPerformance = buildExportSvg;
-  const baseColumnsForPerformance = columns;
   const baseVisibleCoursesForPerformance = visibleCourses;
   const baseVisibleCourseIdsForPerformance = visibleCourseIds;
   const baseCorequisitePairsForPerformance = corequisitePairs;
@@ -24,7 +23,6 @@
 
   let topologyCache = {
     signature: '',
-    columns: null,
     visibleCourses: null,
     visibleIds: null,
     pairs: null,
@@ -66,7 +64,6 @@
     if (signature !== topologyCache.signature) {
       topologyCache = {
         signature,
-        columns: null,
         visibleCourses: null,
         visibleIds: null,
         pairs: null,
@@ -75,12 +72,6 @@
     }
     return topologyCache;
   }
-
-  columns = () => {
-    const cache = currentTopologyCache();
-    if (!cache.columns) cache.columns = baseColumnsForPerformance();
-    return cache.columns;
-  };
 
   visibleCourses = () => {
     const cache = currentTopologyCache();
@@ -213,7 +204,7 @@
   if (!document.querySelector('#curriculum-performance-style')) {
     const style = document.createElement('style');
     style.id = 'curriculum-performance-style';
-    style.textContent = '#flow-canvas{will-change:transform}#connections-svg{pointer-events:none}';
+    style.textContent = '#flow-canvas{will-change:transform}';
     document.head.append(style);
   }
 
