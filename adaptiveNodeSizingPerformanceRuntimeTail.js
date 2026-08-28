@@ -4,10 +4,11 @@
   window.__CURRICULUM_ADAPTIVE_NODE_RUNTIME__ = true;
 
   const BASE_NODE_HEIGHT = 78;
+  const COMPACT_NODE_HEIGHT = 62;
   const MIN_NODE_HEIGHT = 44;
   const MIN_NODE_GAP = 24;
   const COREQ_NODE_GAP = 34;
-  const DRAG_EDGE_INTERVAL_MS = 80;
+  const DRAG_CONNECTOR_INTERVAL_MS = 50;
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const EPS = 0.75;
 
@@ -16,10 +17,14 @@
 
   let adaptiveNodeHeight = BASE_NODE_HEIGHT;
   let measureFrame = 0;
-  let geometryFrame = 0;
-  let dragEdgeTimer = 0;
-  let lastDragEdgeRenderAt = 0;
+  let semanticFrame = 0;
+  let dragConnectorTimer = 0;
+  let lastDragConnectorRefreshAt = 0;
   let applyingClearance = false;
+
+  const legacyNodeHeight = () => flowPanelElement.classList.contains('hide-node-units')
+    ? COMPACT_NODE_HEIGHT
+    : BASE_NODE_HEIGHT;
 
   function installStyles() {
     if (document.querySelector('#adaptive-node-sizing-performance-style')) return;
@@ -135,21 +140,75 @@
     svg.setAttribute('height', `${logicalHeight}`);
   };
 
+  pairGeometry = pair => {
+    const a = state.positions[pair.aId];
+    const b = state.positions[pair.bId];
+    if (!a || !b) return null;
+    const aAbove = a.y <= b.y;
+    const upperId = aAbove ? pair.aId : pair.bId;
+    const lowerId = aAbove ? pair.bId : pair.aId;
+    const upper = state.positions[upperId];
+    const lower = state.positions[lowerId];
+    const upperBottom = upper.y + adaptiveNodeHeight;
+    const lowerTop = lower.y;
+    return {
+      pair,
+      upperId,
+      lowerId,
+      x: upper.x + W / 2,
+      upperBottom,
+      lowerTop,
+      junctionY: (upperBottom + lowerTop) / 2,
+    };
+  };
+
+  function installAdaptiveConnectorGeometry() {
+    const invariants = window.CurriculumConnectorInvariants;
+    if (!invariants || invariants.__adaptiveNodeSizingPatched) return;
+    const baseApplyNow = typeof invariants.applyNow === 'function' ? invariants.applyNow.bind(invariants) : null;
+    const baseRequest = typeof invariants.request === 'function' ? invariants.request.bind(invariants) : null;
+
+    invariants.nodeHeight = () => adaptiveNodeHeight;
+    invariants.applyNow = (...args) => {
+      const dragging = Boolean(nodes.querySelector('.course-node.dragging'));
+      const legacyMatches = Math.abs(adaptiveNodeHeight - legacyNodeHeight()) < 0.5;
+      if (!dragging && legacyMatches && baseApplyNow) return baseApplyNow(...args);
+      return true;
+    };
+    invariants.request = (...args) => {
+      const legacyMatches = Math.abs(adaptiveNodeHeight - legacyNodeHeight()) < 0.5;
+      if (legacyMatches && baseRequest) return baseRequest(...args);
+      return window.CurriculumConnectorSemanticInvariants?.request?.();
+    };
+    invariants.__adaptiveNodeSizingPatched = true;
+  }
+
+  function refreshSemanticConnectors() {
+    installAdaptiveConnectorGeometry();
+    window.CurriculumConnectorSemanticInvariants?.applyNow?.();
+  }
+
+  function scheduleSemanticRefresh() {
+    if (semanticFrame) return;
+    semanticFrame = requestAnimationFrame(() => {
+      semanticFrame = 0;
+      refreshSemanticConnectors();
+    });
+  }
+
   function applyMeasuredHeight(nextHeight) {
     const next = Math.max(MIN_NODE_HEIGHT, Math.ceil(Number(nextHeight) || BASE_NODE_HEIGHT));
-    if (Math.abs(next - adaptiveNodeHeight) < 0.5) {
-      normalizeAdaptiveClearance();
-      updateCanvasSize();
-      scheduleGeometryPatch();
-      return false;
+    const heightChanged = Math.abs(next - adaptiveNodeHeight) >= 0.5;
+    if (heightChanged) {
+      adaptiveNodeHeight = next;
+      flowPanelElement.style.setProperty('--curriculum-adaptive-node-height', `${adaptiveNodeHeight}px`);
     }
-    adaptiveNodeHeight = next;
-    flowPanelElement.style.setProperty('--curriculum-adaptive-node-height', `${adaptiveNodeHeight}px`);
-    normalizeAdaptiveClearance();
+    installAdaptiveConnectorGeometry();
+    const positionsChanged = normalizeAdaptiveClearance();
     updateCanvasSize();
-    renderEdges();
-    scheduleGeometryPatch();
-    return true;
+    if (heightChanged || positionsChanged) renderEdges();
+    scheduleSemanticRefresh();
+    return heightChanged;
   }
 
   function scheduleMeasure() {
@@ -161,223 +220,34 @@
     });
   }
 
-  const number = value => Number.parseFloat(String(value ?? '0')) || 0;
-  const formatNumber = value => Number(Number(value).toFixed(3)).toString();
-
-  function parseOrthogonalPath(d) {
-    if (!d || /[CLQSTAZ]/i.test(d)) return [];
-    const commands = [...String(d).matchAll(/([MHV])\s*(-?[\d.]+)(?:\s+(-?[\d.]+))?/g)];
-    if (!commands.length) return [];
-    const points = [];
-    let x = 0;
-    let y = 0;
-    for (const match of commands) {
-      if (match[1] === 'M') {
-        x = number(match[2]);
-        y = number(match[3]);
-      } else if (match[1] === 'H') x = number(match[2]);
-      else if (match[1] === 'V') y = number(match[2]);
-      points.push({ x, y });
-    }
-    return points;
-  }
-
-  function serializeOrthogonalPath(points) {
-    if (!points.length) return '';
-    let result = `M ${formatNumber(points[0].x)} ${formatNumber(points[0].y)}`;
-    for (let index = 1; index < points.length; index += 1) {
-      const previous = points[index - 1];
-      const point = points[index];
-      if (Math.abs(previous.y - point.y) < 0.001) result += ` H ${formatNumber(point.x)}`;
-      else if (Math.abs(previous.x - point.x) < 0.001) result += ` V ${formatNumber(point.y)}`;
-      else return '';
-    }
-    return result;
-  }
-
-  function currentBoxes() {
-    return visibleCourses().map(course => {
-      const position = state.positions[course.id];
-      if (!position) return null;
-      return {
-        id: course.id,
-        top: position.y,
-        bottom: position.y + adaptiveNodeHeight,
-        left: position.x,
-        right: position.x + W,
-        baselineBottom: position.y + BASE_NODE_HEIGHT,
-      };
-    }).filter(Boolean);
-  }
-
-  function pointTouchesBox(point, box) {
-    return point.x >= box.left - 1 && point.x <= box.right + 1 && point.y >= box.top - 1 && point.y <= box.bottom + 1;
-  }
-
-  function verticalBlocked(x, y1, y2, boxes) {
-    const low = Math.min(y1, y2);
-    const high = Math.max(y1, y2);
-    const clearance = 10;
-    return boxes.some(box =>
-      x > box.left - clearance && x < box.right + clearance &&
-      low < box.bottom + clearance && high > box.top - clearance
-    );
-  }
-
-  function horizontalBlocked(y, x1, x2, boxes, ignored = new Set()) {
-    const left = Math.min(x1, x2);
-    const right = Math.max(x1, x2);
-    const clearance = 10;
-    return boxes.some((box, index) => {
-      if (ignored.has(index)) return false;
-      return y > box.top - clearance && y < box.bottom + clearance &&
-        left < box.right + clearance && right > box.left - clearance;
+  function updateCorequisitesDuringDrag() {
+    const pairs = corequisitePairs();
+    const paths = [...svg.querySelectorAll('.corequisite-line')];
+    pairs.forEach((pair, index) => {
+      const geometry = pairGeometry(pair);
+      if (!geometry) return;
+      const left = paths[index * 2];
+      const right = paths[index * 2 + 1];
+      if (left) left.setAttribute('d', `M ${geometry.x - 5} ${geometry.upperBottom} V ${geometry.lowerTop}`);
+      if (right) right.setAttribute('d', `M ${geometry.x + 5} ${geometry.lowerTop} V ${geometry.upperBottom}`);
     });
   }
 
-  function touchingBoxIndexes(point, boxes) {
-    return new Set(boxes.map((box, index) => pointTouchesBox(point, box) ? index : -1).filter(index => index >= 0));
-  }
-
-  function verticalLaneCandidates(currentX, boxes) {
-    const values = new Set([currentX]);
-    const step = 12;
-    for (let index = 1; index <= 24; index += 1) {
-      values.add(currentX - index * step);
-      values.add(currentX + index * step);
-    }
-    boxes.forEach(box => {
-      values.add(box.left - 12);
-      values.add(box.right + 12);
-    });
-    const maxRight = Math.max(W, ...boxes.map(box => box.right));
-    const minLeft = Math.min(0, ...boxes.map(box => box.left));
-    values.add(Math.max(8, minLeft - 26));
-    values.add(maxRight + 26);
-    values.add(Math.max(8, logicalWidth - 14));
-    return [...values]
-      .filter(value => Number.isFinite(value) && value >= 6)
-      .sort((a, b) => Math.abs(a - currentX) - Math.abs(b - currentX));
-  }
-
-  function avoidAdaptiveNodeIntersections(path, boxes) {
-    const d = path.getAttribute('d') || '';
-    const points = parseOrthogonalPath(d);
-    if (points.length < 3) return;
-    let changed = false;
-    for (let index = 0; index < points.length - 1; index += 1) {
-      const start = points[index];
-      const end = points[index + 1];
-      if (Math.abs(start.x - end.x) > 0.001 || Math.abs(start.y - end.y) < 0.001) continue;
-      if (!verticalBlocked(start.x, start.y, end.y, boxes)) continue;
-      const previous = points[index - 1] || start;
-      const next = points[index + 2] || end;
-      const startIgnored = touchingBoxIndexes(previous, boxes);
-      const endIgnored = touchingBoxIndexes(next, boxes);
-      const candidates = verticalLaneCandidates(start.x, boxes);
-      let safeX = candidates.find(candidate => {
-        if (verticalBlocked(candidate, start.y, end.y, boxes)) return false;
-        if (index > 0 && horizontalBlocked(start.y, previous.x, candidate, boxes, startIgnored)) return false;
-        if (index + 2 < points.length && horizontalBlocked(end.y, candidate, next.x, boxes, endIgnored)) return false;
-        return true;
-      });
-      if (safeX === undefined) safeX = candidates.find(candidate => !verticalBlocked(candidate, start.y, end.y, boxes));
-      if (safeX === undefined) continue;
-      start.x = safeX;
-      end.x = safeX;
-      changed = true;
-    }
-    if (!changed) return;
-    const serialized = serializeOrthogonalPath(points);
-    if (serialized) path.setAttribute('d', serialized);
-  }
-
-  function relationshipBaseD(path) {
-    return path.getAttribute('data-display-base-d') ||
-      path.getAttribute('data-adaptive-base-d') ||
-      path.getAttribute('d') || '';
-  }
-
-  function shiftRelationshipD(d, delta) {
-    if (!d || Math.abs(delta) < 0.001) return d;
-    const centerShift = delta / 2;
-    let next = String(d).replace(/^M\s+(-?[\d.]+)\s+(-?[\d.]+)/, (_, x, y) => `M ${x} ${number(y) - centerShift}`);
-    const matches = [...next.matchAll(/V\s+(-?[\d.]+)\s+H\s+(-?[\d.]+)/g)];
-    if (matches.length) {
-      const last = matches[matches.length - 1];
-      const replacement = `V ${number(last[1]) - centerShift} H ${last[2]}`;
-      next = next.slice(0, last.index) + replacement + next.slice(last.index + last[0].length);
-    }
-    return next;
-  }
-
-  function shiftCorequisiteD(d, delta, boxes) {
-    if (!d || Math.abs(delta) < 0.001) return d;
-    const match = String(d).match(/^M\s+(-?[\d.]+)\s+(-?[\d.]+)\s+V\s+(-?[\d.]+)/);
-    if (!match) return d;
-    const x = number(match[1]);
-    let y1 = number(match[2]);
-    let y2 = number(match[3]);
-    const isBaselineBottom = y => boxes.some(box => Math.abs(box.baselineBottom - y) < 0.9 && x >= box.left - 8 && x <= box.right + 8);
-    if (isBaselineBottom(y1)) y1 -= delta;
-    if (isBaselineBottom(y2)) y2 -= delta;
-    return `M ${match[1]} ${formatNumber(y1)} V ${formatNumber(y2)}`;
-  }
-
-  function patchLiveGeometry(duringDrag = false) {
-    const boxes = currentBoxes();
-    if (!boxes.length) return;
-    const delta = BASE_NODE_HEIGHT - adaptiveNodeHeight;
-
-    svg.querySelectorAll('.relationship').forEach(path => {
-      const base = relationshipBaseD(path);
-      if (!path.hasAttribute('data-adaptive-base-d')) path.setAttribute('data-adaptive-base-d', base);
-      path.setAttribute('d', shiftRelationshipD(base, delta));
-      if (!duringDrag) avoidAdaptiveNodeIntersections(path, boxes);
-    });
-
-    svg.querySelectorAll('.corequisite-line').forEach(path => {
-      const base = relationshipBaseD(path);
-      if (!path.hasAttribute('data-adaptive-base-d')) path.setAttribute('data-adaptive-base-d', base);
-      path.setAttribute('d', shiftCorequisiteD(base, delta, boxes));
-    });
-  }
-
-  function scheduleGeometryPatch() {
-    if (geometryFrame) return;
-    geometryFrame = requestAnimationFrame(() => {
-      geometryFrame = 0;
-      patchLiveGeometry(Boolean(nodes.querySelector('.course-node.dragging')));
-    });
-  }
-
-  function suppressDeferredRoutingWhile(callback) {
-    const nativeRaf = window.requestAnimationFrame;
-    let result;
-    try {
-      window.requestAnimationFrame = () => 0;
-      result = callback();
-    } finally {
-      window.requestAnimationFrame = nativeRaf;
-    }
-    return result;
-  }
-
-  function renderDragEdges() {
-    dragEdgeTimer = 0;
+  function refreshDragConnectors() {
+    dragConnectorTimer = 0;
     if (!gesture || gesture.kind !== 'node' || !gesture.moved) return;
-    suppressDeferredRoutingWhile(() => renderEdges());
-    lastDragEdgeRenderAt = performance.now();
-    patchLiveGeometry(true);
+    refreshSemanticConnectors();
+    updateCorequisitesDuringDrag();
+    lastDragConnectorRefreshAt = performance.now();
   }
 
-  function scheduleDragEdges() {
-    if (dragEdgeTimer) return;
-    const elapsed = performance.now() - lastDragEdgeRenderAt;
-    const delay = Math.max(0, DRAG_EDGE_INTERVAL_MS - elapsed);
-    dragEdgeTimer = window.setTimeout(() => {
-      dragEdgeTimer = 0;
-      requestAnimationFrame(renderDragEdges);
+  function scheduleDragConnectorRefresh() {
+    if (dragConnectorTimer) return;
+    const elapsed = performance.now() - lastDragConnectorRefreshAt;
+    const delay = Math.max(0, DRAG_CONNECTOR_INTERVAL_MS - elapsed);
+    dragConnectorTimer = window.setTimeout(() => {
+      dragConnectorTimer = 0;
+      requestAnimationFrame(refreshDragConnectors);
     }, delay);
   }
 
@@ -442,7 +312,9 @@
       }
     });
 
-    scheduleDragEdges();
+    // Keep node motion on the pointer path. Expensive route-plan rebuilding stays deferred
+    // until pointer-up; existing connector DOM is updated in-place at a modest cadence.
+    scheduleDragConnectorRefresh();
   };
   viewport.addEventListener('pointermove', optimizedPointerMove);
 
@@ -456,6 +328,9 @@
     };
     hygiene.__adaptiveDragGuard = true;
   }
+
+  const number = value => Number.parseFloat(String(value ?? '0')) || 0;
+  const formatNumber = value => Number(Number(value).toFixed(3)).toString();
 
   function isElementVisible(element) {
     if (!(element instanceof HTMLElement)) return false;
@@ -472,12 +347,13 @@
 
     try {
       const bounds = element.getBoundingClientRect();
-      const matches = [...raw.matchAll(/\S+\s*/g)];
+      const sourceText = String(textNode.textContent || '');
+      const matches = [...sourceText.matchAll(/\S+\s*/g)];
       const lines = [];
       let hiddenContent = false;
       for (const match of matches) {
         const start = match.index ?? 0;
-        const end = Math.min(textNode.textContent?.length ?? raw.length, start + match[0].length);
+        const end = Math.min(sourceText.length, start + match[0].length);
         const range = document.createRange();
         range.setStart(textNode, start);
         range.setEnd(textNode, end);
@@ -565,8 +441,8 @@
         const rect = [...group.children].find(child => child.tagName?.toLowerCase() === 'rect');
         if (!rect) return false;
         return Math.abs(number(rect.getAttribute('width')) - W) < 0.01 &&
-          Math.abs(number(rect.getAttribute('x')) - record.position.x) < 0.75 &&
-          Math.abs(number(rect.getAttribute('y')) - record.position.y) < 0.75;
+          Math.abs(number(rect.getAttribute('x')) - record.position.x) < EPS &&
+          Math.abs(number(rect.getAttribute('y')) - record.position.y) < EPS;
       });
       if (!match) continue;
       used.add(match);
@@ -589,30 +465,12 @@
         replaceCourseTextWithLiveLayout(documentXml, record.group, record);
       });
 
-      const boxes = records.map(record => ({
-        top: record.position.y,
-        bottom: record.position.y + adaptiveNodeHeight,
-        left: record.position.x,
-        right: record.position.x + W,
-        baselineBottom: record.position.y + BASE_NODE_HEIGHT,
-      }));
-      const delta = BASE_NODE_HEIGHT - adaptiveNodeHeight;
-
-      [...root.querySelectorAll('path')].forEach(path => {
-        if (path.closest('defs')) return;
-        const markerEnd = path.getAttribute('marker-end') || '';
-        const className = path.getAttribute('class') || '';
-        const isCorequisite = markerEnd.includes('export-coreq') || className.includes('export-corequisite');
-        const hasRelationshipIdentity = markerEnd.includes('export-arrow') || path.hasAttribute('data-display-base-d');
-        if (isCorequisite) {
-          const base = relationshipBaseD(path);
-          path.setAttribute('d', shiftCorequisiteD(base, delta, boxes));
-          return;
-        }
-        if (!hasRelationshipIdentity) return;
-        const base = relationshipBaseD(path);
-        path.setAttribute('d', shiftRelationshipD(base, delta));
-        avoidAdaptiveNodeIntersections(path, boxes);
+      // The legacy display filter may have shifted export paths to its fixed 62 px compact
+      // height. Semantic routing already used the adaptive height, so restore its pre-filter
+      // path whenever that canonical path is available.
+      root.querySelectorAll('path[data-display-base-d]').forEach(path => {
+        const base = path.getAttribute('data-display-base-d');
+        if (base) path.setAttribute('d', base);
       });
 
       return new XMLSerializer().serializeToString(root);
@@ -636,6 +494,8 @@
         }
       }
       window.Blob = AdaptiveExportBlob;
+      // Existing export decorators restore on a zero-delay timer. Restore this outer base
+      // after those decorators so Blob never remains patched after a download.
       window.setTimeout(() => {
         if (window.Blob === AdaptiveExportBlob) window.Blob = PreviousBlob;
       }, 25);
@@ -644,6 +504,7 @@
 
   installStyles();
   flowPanelElement.style.setProperty('--curriculum-adaptive-node-height', `${adaptiveNodeHeight}px`);
+  installAdaptiveConnectorGeometry();
   installHygieneDragGuard();
   installExportDecorator();
 
@@ -655,31 +516,38 @@
   });
   flowObserver.observe(flowPanelElement, { attributes: true, attributeFilter: ['class', 'style', 'hidden'] });
 
-  const geometryObserver = new MutationObserver(scheduleGeometryPatch);
-  geometryObserver.observe(svg, { childList: true, subtree: true });
+  // The legacy display patch runs from a child-list observer and assumes 78/62 px heights.
+  // Re-assert semantic routing one animation frame later so adaptive geometry is the final
+  // on-canvas result without introducing another path-rewriting algorithm.
+  const connectorObserver = new MutationObserver(scheduleSemanticRefresh);
+  connectorObserver.observe(svg, { childList: true, subtree: true });
 
   document.addEventListener('pointerup', () => {
     window.setTimeout(() => {
-      if (!nodes.querySelector('.course-node.dragging')) {
-        if (dragEdgeTimer) {
-          clearTimeout(dragEdgeTimer);
-          dragEdgeTimer = 0;
-        }
-        scheduleMeasure();
-        scheduleGeometryPatch();
+      if (dragConnectorTimer) {
+        clearTimeout(dragConnectorTimer);
+        dragConnectorTimer = 0;
       }
+      scheduleMeasure();
+      scheduleSemanticRefresh();
     }, 0);
   }, true);
-  document.addEventListener('pointercancel', () => scheduleMeasure(), true);
+  document.addEventListener('pointercancel', () => {
+    if (dragConnectorTimer) {
+      clearTimeout(dragConnectorTimer);
+      dragConnectorTimer = 0;
+    }
+    scheduleMeasure();
+  }, true);
 
-  document.fonts?.ready?.then?.(scheduleMeasure).catch?.(() => {});
+  if (document.fonts?.ready) document.fonts.ready.then(scheduleMeasure).catch(() => {});
   scheduleMeasure();
-  scheduleGeometryPatch();
+  scheduleSemanticRefresh();
 
   window.CurriculumAdaptiveNodeSizing = {
     getHeight: () => adaptiveNodeHeight,
-    refresh: () => { scheduleMeasure(); scheduleGeometryPatch(); },
+    refresh: () => { scheduleMeasure(); scheduleSemanticRefresh(); },
     exportSvg: applyAdaptiveExportSvg,
-    version: 1,
+    version: 2,
   };
 })();
