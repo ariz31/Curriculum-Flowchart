@@ -1,43 +1,85 @@
 
 ;(() => {
-  const STORAGE_KEY = 'curriculum-flowchart:export-resolution-unlimited:v1';
+  const STORAGE_KEY = 'curriculum-flowchart:export-output-size:v2';
+  const LEGACY_SCALE_KEY = 'curriculum-flowchart:export-resolution-unlimited:v1';
   const LEGACY_SETTINGS_KEY = 'curriculum-flowchart:export-settings:v1';
   const CURRICULUM_LIBRARY_KEY = 'curriculum-flowchart:curricula:v1';
-  const DEFAULT_SCALE = 4;
-  const PRESETS = [1, 2, 3, 4, 6, 8, 12, 16];
+  const DEFAULT_WIDTH = 8192;
+  const MIN_WIDTH = 512;
+  const WIDTH_PRESETS = [4096, 8192, 12288, 16384, 24576, 32768];
 
   const safeParse = value => { try { return value ? JSON.parse(value) : null; } catch { return null; } };
   const activeCurriculumId = () => String(safeParse(localStorage.getItem(CURRICULUM_LIBRARY_KEY))?.activeId || 'default');
-  const validScale = value => {
+  const finitePositive = (value, fallback) => {
     const number = Number(value);
-    return Number.isFinite(number) && number >= 1 ? number : DEFAULT_SCALE;
+    return Number.isFinite(number) && number > 0 ? number : fallback;
   };
+  const formatNumber = value => Math.round(Number(value) || 0).toLocaleString();
 
-  function allScales() {
+  function exportGeometry() {
+    const width = Math.max(1, Number(logicalWidth) || 1);
+    const baseHeight = Math.max(1, Number(logicalHeight) || 1);
+    const extraHeight = Math.max(0, Number(window.CurriculumExportTitleMetrics?.extraHeightForWidth?.(width)) || 0);
+    const height = baseHeight + extraHeight;
+    return { width, height, aspect: width / height };
+  }
+
+  function allConfigs() {
     const stored = safeParse(localStorage.getItem(STORAGE_KEY));
     return stored && typeof stored === 'object' ? stored : {};
   }
 
   function legacyScale() {
+    const direct = safeParse(localStorage.getItem(LEGACY_SCALE_KEY));
+    const directScale = Number(direct?.[activeCurriculumId()]);
+    if (Number.isFinite(directScale) && directScale >= 1) return directScale;
     const stored = safeParse(localStorage.getItem(LEGACY_SETTINGS_KEY));
-    const entry = stored && typeof stored === 'object' ? stored[activeCurriculumId()] : null;
-    const scale = Number(entry?.scale);
+    const scale = Number(stored?.[activeCurriculumId()]?.scale);
     return Number.isFinite(scale) && scale >= 1 ? scale : null;
   }
 
-  function getScale() {
-    const stored = Number(allScales()[activeCurriculumId()]);
-    if (Number.isFinite(stored) && stored >= 1) return stored;
-    return legacyScale() || DEFAULT_SCALE;
+  function normalizeWidth(value) {
+    return Math.max(MIN_WIDTH, Math.round(finitePositive(value, DEFAULT_WIDTH)));
   }
 
-  function saveScale(value, options = {}) {
-    const scale = validScale(value);
-    const all = allScales();
-    all[activeCurriculumId()] = scale;
+  function migratedWidth() {
+    const scale = legacyScale();
+    if (!scale) return DEFAULT_WIDTH;
+    return Math.max(DEFAULT_WIDTH, Math.round(exportGeometry().width * scale));
+  }
+
+  function getWidth() {
+    const entry = allConfigs()[activeCurriculumId()];
+    const storedWidth = Number(entry?.width ?? entry);
+    return Number.isFinite(storedWidth) && storedWidth >= MIN_WIDTH ? Math.round(storedWidth) : migratedWidth();
+  }
+
+  function getOutputSize() {
+    const width = getWidth();
+    const aspect = exportGeometry().aspect;
+    return {
+      width,
+      height: Math.max(1, Math.round(width / aspect)),
+    };
+  }
+
+  function saveWidth(value, options = {}) {
+    const width = normalizeWidth(value);
+    const all = allConfigs();
+    all[activeCurriculumId()] = { width };
     localStorage.setItem(STORAGE_KEY, JSON.stringify(all));
     if (options.sync !== false) syncControls();
-    return scale;
+    return getOutputSize();
+  }
+
+  function saveHeight(value, options = {}) {
+    const height = Math.max(1, Math.round(finitePositive(value, getOutputSize().height)));
+    const width = Math.max(MIN_WIDTH, Math.round(height * exportGeometry().aspect));
+    return saveWidth(width, options);
+  }
+
+  function getScale() {
+    return getOutputSize().width / exportGeometry().width;
   }
 
   const previousApi = window.CurriculumExportSettings || {};
@@ -47,83 +89,105 @@
   window.CurriculumExportSettings = {
     ...previousApi,
     getScale,
-    setScale: value => saveScale(value),
-    exportState: () => ({ ...(previousExportState?.() || {}), scale: getScale() }),
+    setScale: value => saveWidth(exportGeometry().width * Math.max(1, finitePositive(value, 1))),
+    getOutputSize,
+    setOutputWidth: value => saveWidth(value),
+    setOutputHeight: value => saveHeight(value),
+    exportState: () => ({
+      ...(previousExportState?.() || {}),
+      outputWidth: getOutputSize().width,
+      outputHeight: getOutputSize().height,
+      scale: getScale(),
+    }),
     importState: (value, options = {}) => {
       previousImportState?.(value, options);
-      if (value && Number.isFinite(Number(value.scale)) && Number(value.scale) >= 1) saveScale(value.scale, { sync: false });
+      if (value && Number.isFinite(Number(value.outputWidth)) && Number(value.outputWidth) >= MIN_WIDTH) {
+        saveWidth(value.outputWidth, { sync: false });
+      } else if (value && Number.isFinite(Number(value.scale)) && Number(value.scale) >= 1) {
+        saveWidth(exportGeometry().width * Number(value.scale), { sync: false });
+      }
       syncControls();
     },
   };
 
-  let scaleSelect = null;
-  let customInput = null;
+  let sizeSelect = null;
+  let widthInput = null;
+  let heightInput = null;
+  let summary = null;
 
-  function createResolutionControls() {
+  function megapixels(size) {
+    return (size.width * size.height / 1_000_000).toFixed(size.width * size.height >= 100_000_000 ? 0 : 1);
+  }
+
+  function createSizeControls() {
     const oldSelect = document.querySelector('#export-resolution-level');
-    if (!(oldSelect instanceof HTMLSelectElement) || oldSelect.dataset.unlimitedResolution === 'true') return;
+    if (!(oldSelect instanceof HTMLSelectElement) || oldSelect.dataset.pixelSizeControl === 'true') return;
+
+    const field = oldSelect.closest('.minimal-resolution-field');
+    const fieldTitle = field?.querySelector(':scope > span');
+    if (fieldTitle) fieldTitle.textContent = 'Output size';
 
     const select = document.createElement('select');
     select.id = 'export-resolution-level';
-    select.dataset.unlimitedResolution = 'true';
-    select.setAttribute('aria-label', 'PNG export resolution');
+    select.dataset.pixelSizeControl = 'true';
+    select.setAttribute('aria-label', 'PNG output pixel width');
     select.innerHTML = `
-      <option value="1">Standard · 1×</option>
-      <option value="2">High · 2×</option>
-      <option value="3">Ultra · 3×</option>
-      <option value="4">4K+ · 4×</option>
-      <option value="6">Very high · 6×</option>
-      <option value="8">Extreme · 8×</option>
-      <option value="12">Maximum+ · 12×</option>
-      <option value="16">Extreme+ · 16×</option>
-      <option value="custom">Custom…</option>`;
-
-    const custom = document.createElement('input');
-    custom.id = 'export-resolution-custom';
-    custom.type = 'number';
-    custom.min = '1';
-    custom.step = '0.5';
-    custom.inputMode = 'decimal';
-    custom.setAttribute('aria-label', 'Custom PNG export scale multiplier');
-    custom.placeholder = 'Scale multiplier';
-    custom.hidden = true;
-
+      <option value="4096">Large · 4,096 px wide</option>
+      <option value="8192">Very large · 8,192 px wide</option>
+      <option value="12288">12K · 12,288 px wide</option>
+      <option value="16384">16K · 16,384 px wide</option>
+      <option value="24576">24K · 24,576 px wide</option>
+      <option value="32768">32K · 32,768 px wide</option>
+      <option value="custom">Custom dimensions…</option>`;
     oldSelect.replaceWith(select);
-    select.insertAdjacentElement('afterend', custom);
-    scaleSelect = select;
-    customInput = custom;
+    sizeSelect = select;
+
+    const dimensions = document.createElement('div');
+    dimensions.className = 'export-pixel-dimensions';
+    dimensions.innerHTML = `
+      <label><span>Width</span><span class="export-pixel-input"><input id="export-pixel-width" type="number" min="${MIN_WIDTH}" step="1" inputmode="numeric" aria-label="PNG output width in pixels" /><em>px</em></span></label>
+      <span class="export-aspect-lock" title="Width and height stay proportional to the complete exported flowchart">🔒</span>
+      <label><span>Height</span><span class="export-pixel-input"><input id="export-pixel-height" type="number" min="1" step="1" inputmode="numeric" aria-label="PNG output height in pixels" /><em>px</em></span></label>
+      <small id="export-pixel-summary"></small>`;
+    (field || select.parentElement)?.insertAdjacentElement('afterend', dimensions);
+
+    widthInput = dimensions.querySelector('#export-pixel-width');
+    heightInput = dimensions.querySelector('#export-pixel-height');
+    summary = dimensions.querySelector('#export-pixel-summary');
 
     select.addEventListener('change', () => {
       if (select.value === 'custom') {
-        custom.hidden = false;
-        custom.value = String(getScale());
-        custom.focus();
-        custom.select();
+        widthInput?.focus();
+        widthInput?.select();
         return;
       }
-      custom.hidden = true;
-      const scale = saveScale(select.value);
-      window.CurriculumFlowchartRuntime?.setHint?.(`PNG export resolution set to ${scale}× with no application dimension cap.`);
+      const size = saveWidth(select.value);
+      window.CurriculumFlowchartRuntime?.setHint?.(`PNG output size set to ${formatNumber(size.width)} × ${formatNumber(size.height)} px.`);
     });
 
-    custom.addEventListener('change', () => {
-      const scale = saveScale(custom.value);
-      custom.value = String(scale);
-      window.CurriculumFlowchartRuntime?.setHint?.(`Custom PNG export resolution set to ${scale}× with no application dimension cap.`);
+    widthInput?.addEventListener('change', () => {
+      const size = saveWidth(widthInput.value);
+      window.CurriculumFlowchartRuntime?.setHint?.(`PNG width set to ${formatNumber(size.width)} px; height adjusted proportionally to ${formatNumber(size.height)} px.`);
     });
-    custom.addEventListener('keydown', event => {
-      if (event.key === 'Enter') {
-        event.preventDefault();
-        custom.blur();
-      }
+    heightInput?.addEventListener('change', () => {
+      const size = saveHeight(heightInput.value);
+      window.CurriculumFlowchartRuntime?.setHint?.(`PNG height set to ${formatNumber(size.height)} px; width adjusted proportionally to ${formatNumber(size.width)} px.`);
     });
+    [widthInput, heightInput].forEach(input => input?.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); input.blur(); }
+    }));
 
     if (!document.querySelector('#unlimited-export-resolution-style')) {
       const style = document.createElement('style');
       style.id = 'unlimited-export-resolution-style';
       style.textContent = `
-        #export-resolution-custom{width:100%;min-height:36px;border:1px solid #d8deea;border-radius:8px;padding:6px 8px;background:#fff;color:#172033;font:inherit;font-size:.78rem;margin-top:5px}
-        #export-resolution-custom[hidden]{display:none!important}
+        .export-pixel-dimensions{display:grid;grid-template-columns:minmax(0,1fr) 24px minmax(0,1fr);align-items:end;gap:6px;padding:2px 0 7px}
+        .export-pixel-dimensions>label{display:grid;gap:4px;color:#475467;font-size:.7rem;font-weight:750}
+        .export-pixel-input{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;border:1px solid #d8deea;border-radius:8px;background:#fff;overflow:hidden}
+        .export-pixel-input input{width:100%;min-width:0;min-height:36px;border:0;padding:6px 8px;background:transparent;color:#172033;font:inherit;font-size:.78rem;outline:none}
+        .export-pixel-input em{padding-right:7px;color:#7a879c;font-size:.68rem;font-style:normal;font-weight:650}
+        .export-aspect-lock{align-self:end;display:grid;place-items:center;height:36px;color:#667085;font-size:.72rem}
+        #export-pixel-summary{grid-column:1/-1;color:#667085;font-size:.67rem;line-height:1.35}
       `;
       document.head.append(style);
     }
@@ -132,62 +196,54 @@
   }
 
   function syncControls() {
-    if (!(scaleSelect instanceof HTMLSelectElement)) scaleSelect = document.querySelector('#export-resolution-level');
-    if (!(customInput instanceof HTMLInputElement)) customInput = document.querySelector('#export-resolution-custom');
-    if (!(scaleSelect instanceof HTMLSelectElement)) return;
-    const scale = getScale();
-    const preset = PRESETS.find(value => Math.abs(value - scale) < 0.0001);
-    if (preset) {
-      scaleSelect.value = String(preset);
-      if (customInput instanceof HTMLInputElement) customInput.hidden = true;
-    } else {
-      scaleSelect.value = 'custom';
-      if (customInput instanceof HTMLInputElement) {
-        customInput.hidden = false;
-        customInput.value = String(scale);
-      }
+    if (!(sizeSelect instanceof HTMLSelectElement)) sizeSelect = document.querySelector('#export-resolution-level');
+    if (!(widthInput instanceof HTMLInputElement)) widthInput = document.querySelector('#export-pixel-width');
+    if (!(heightInput instanceof HTMLInputElement)) heightInput = document.querySelector('#export-pixel-height');
+    if (!(summary instanceof HTMLElement)) summary = document.querySelector('#export-pixel-summary');
+    const size = getOutputSize();
+    const preset = WIDTH_PRESETS.find(value => value === size.width);
+    if (sizeSelect instanceof HTMLSelectElement) sizeSelect.value = preset ? String(preset) : 'custom';
+    if (widthInput instanceof HTMLInputElement) widthInput.value = String(size.width);
+    if (heightInput instanceof HTMLInputElement) heightInput.value = String(size.height);
+    if (summary instanceof HTMLElement) {
+      summary.textContent = `${formatNumber(size.width)} × ${formatNumber(size.height)} px · ${megapixels(size)} MP · aspect ratio locked · no application size cap`;
     }
   }
 
-  // Final export scaler: it deliberately replaces the earlier 16,384 px application cap.
-  // The requested multiplier is applied directly. Browser/OS canvas and memory limits remain
-  // implementation-defined and are no longer pre-emptively constrained by this application.
+  // Final output-size writer. The application's earlier multiplier and 12k/16k guards are
+  // intentionally superseded here: the selected pixel dimensions are applied exactly.
+  // Browser/OS canvas and memory limits still apply because those are outside the application.
   const canvasWidth = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'width');
   const canvasHeight = Object.getOwnPropertyDescriptor(HTMLCanvasElement.prototype, 'height');
   const previousCreateElement = Document.prototype.createElement;
   let exportArmed = false;
 
-  function prepareUnlimitedCanvas(canvas) {
+  function prepareExactSizeCanvas(canvas) {
     if (!canvasWidth?.get || !canvasWidth?.set || !canvasHeight?.get || !canvasHeight?.set) return;
-    let requestedWidth = 0;
-
     Object.defineProperty(canvas, 'width', {
       configurable: true,
       get() { return canvasWidth.get.call(canvas); },
-      set(value) {
-        requestedWidth = Math.max(1, Number(value) || 1);
-        canvasWidth.set.call(canvas, requestedWidth);
+      set() {
+        const size = getOutputSize();
+        canvasWidth.set.call(canvas, size.width);
       },
     });
-
     Object.defineProperty(canvas, 'height', {
       configurable: true,
       get() { return canvasHeight.get.call(canvas); },
-      set(value) {
-        const requestedHeight = Math.max(1, Number(value) || 1);
-        const width = Math.max(1, requestedWidth || canvasWidth.get.call(canvas));
-        const scale = getScale();
-        canvasWidth.set.call(canvas, Math.max(1, Math.round(width * scale)));
-        canvasHeight.set.call(canvas, Math.max(1, Math.round(requestedHeight * scale)));
+      set() {
+        const size = getOutputSize();
+        canvasWidth.set.call(canvas, size.width);
+        canvasHeight.set.call(canvas, size.height);
       },
     });
   }
 
-  Document.prototype.createElement = function unlimitedResolutionCreateElement(tagName, options) {
+  Document.prototype.createElement = function exactPixelSizeCreateElement(tagName, options) {
     const element = previousCreateElement.call(this, tagName, options);
     if (exportArmed && String(tagName).toLowerCase() === 'canvas' && element instanceof HTMLCanvasElement) {
       exportArmed = false;
-      prepareUnlimitedCanvas(element);
+      prepareExactSizeCanvas(element);
     }
     return element;
   };
@@ -197,11 +253,13 @@
     window.setTimeout(() => { exportArmed = false; }, 1500);
   }, true);
 
-  createResolutionControls();
+  createSizeControls();
   syncControls();
 
+  const refresh = () => syncControls();
   const curriculumObserver = new MutationObserver(mutations => {
-    if (mutations.some(mutation => mutation.type === 'attributes' && mutation.attributeName === 'data-curriculum-title')) syncControls();
+    if (mutations.some(mutation => mutation.type === 'attributes' && mutation.attributeName === 'data-curriculum-title')) refresh();
   });
   curriculumObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-curriculum-title'] });
+  window.addEventListener('resize', refresh);
 })();
