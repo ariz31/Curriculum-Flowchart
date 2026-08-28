@@ -8,24 +8,11 @@
 
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
-  const titleMetrics = width => {
-    const safeWidth = Math.max(1, Number(width) || 1);
-    const titleSize = clamp(safeWidth * 0.012, MIN_TITLE_SIZE, MAX_TITLE_SIZE);
-    const titleBaseline = TITLE_TOP_PADDING + titleSize;
-    const dividerY = titleBaseline + TITLE_DIVIDER_GAP;
-    const titleShift = dividerY + TITLE_CONTENT_GAP;
-    return { titleSize, titleBaseline, dividerY, titleShift };
-  };
-
   const activeTitle = () => {
     const fromSettings = window.CurriculumExportSettings?.getTitle?.();
     const fromDataset = document.documentElement.dataset.curriculumTitle;
     const fromGlobal = window.__CURRICULUM_TITLE__;
     return String(fromSettings || fromDataset || fromGlobal || 'Curriculum Flowchart').trim() || 'Curriculum Flowchart';
-  };
-
-  window.CurriculumExportTitleMetrics = {
-    extraHeightForWidth: width => titleMetrics(width).titleShift,
   };
 
   function addExportTitle(svgText) {
@@ -39,7 +26,10 @@
       const originalHeight = Number(root.getAttribute('height')) || (viewBox.length === 4 ? viewBox[3] : 0);
       if (!originalWidth || !originalHeight) return svgText;
 
-      const { titleSize, titleBaseline, dividerY, titleShift } = titleMetrics(originalWidth);
+      const titleSize = clamp(originalWidth * 0.012, MIN_TITLE_SIZE, MAX_TITLE_SIZE);
+      const titleBaseline = TITLE_TOP_PADDING + titleSize;
+      const dividerY = titleBaseline + TITLE_DIVIDER_GAP;
+      const titleShift = dividerY + TITLE_CONTENT_GAP;
       const ns = 'http://www.w3.org/2000/svg';
       const nextHeight = originalHeight + titleShift;
       root.setAttribute('height', String(nextHeight));
